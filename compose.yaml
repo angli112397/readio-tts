@@ -1,0 +1,102 @@
+name: readio-tts
+
+services:
+  fish-speech:
+    image: fishaudio/fish-speech:v1.5.0@sha256:38047bf09081f8827febce4a62fab5998ab41f620ebb4a720960a614eaaa165e
+    restart: unless-stopped
+    init: true
+    environment:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True,max_split_size_mb:128
+    command:
+      - python
+      - -m
+      - tools.api_server
+      - --listen
+      - 0.0.0.0:8080
+      - --llama-checkpoint-path
+      - /opt/fish-speech/checkpoints/fish-speech-1.5
+      - --decoder-checkpoint-path
+      - /opt/fish-speech/checkpoints/fish-speech-1.5/firefly-gan-vq-fsq-8x1024-21hz-generator.pth
+      - --decoder-config-name
+      - firefly_gan_vq
+      - --half
+      - --workers
+      - "1"
+    volumes:
+      - ./references:/opt/fish-speech/references
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8080/v1/health', method='POST'), timeout=5)"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+    networks:
+      - backend
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    depends_on:
+      fish-speech:
+        condition: service_healthy
+    environment:
+      READIO_PROVIDER: fish
+      READIO_STORAGE_DIR: /app/data/jobs
+      READIO_MAX_CHAPTER_CHARACTERS: ${READIO_MAX_CHAPTER_CHARACTERS:-200000}
+      READIO_SENTENCE_GAP_MS: ${READIO_SENTENCE_GAP_MS:-600}
+      READIO_JOB_RETENTION_DAYS: ${READIO_JOB_RETENTION_DAYS:-7}
+      READIO_AUDIO_URL_SIGNING_KEY: ${READIO_AUDIO_URL_SIGNING_KEY:-replace-for-non-local-use}
+      READIO_FISH_BASE_URL: http://fish-speech:8080
+      READIO_FISH_REFERENCE_ID: ${READIO_FISH_REFERENCE_ID:-}
+      READIO_FISH_TIMEOUT_SECONDS: ${READIO_FISH_TIMEOUT_SECONDS:-300}
+      READIO_FISH_CHUNK_LENGTH: ${READIO_FISH_CHUNK_LENGTH:-200}
+      READIO_FISH_MAX_NEW_TOKENS: ${READIO_FISH_MAX_NEW_TOKENS:-1024}
+      READIO_FISH_TOP_P: ${READIO_FISH_TOP_P:-0.7}
+      READIO_FISH_TEMPERATURE: ${READIO_FISH_TEMPERATURE:-0.7}
+      READIO_FISH_REPETITION_PENALTY: ${READIO_FISH_REPETITION_PENALTY:-1.2}
+      READIO_FISH_NORMALIZE: ${READIO_FISH_NORMALIZE:-true}
+      READIO_FISH_USE_MEMORY_CACHE: ${READIO_FISH_USE_MEMORY_CACHE:-on}
+    ports:
+      - "${READIO_GATEWAY_BIND:-0.0.0.0}:${READIO_GATEWAY_PORT:-8090}:8090"
+    volumes:
+      - jobs:/app/data/jobs
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=5)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - backend
+      - ingress
+
+networks:
+  backend:
+    internal: true
+  ingress:
+
+volumes:
+  jobs:
