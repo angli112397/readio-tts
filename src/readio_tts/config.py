@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -13,8 +14,10 @@ class Settings(BaseSettings):
     )
 
     provider: Literal["mock", "gpt"] = "gpt"
-    storage_dir: Path = Path("data/jobs")
-    max_chapter_characters: int = 200_000
+    data_dir: Path = Path(
+        os.environ.get("LOCALAPPDATA", ".")
+    ) / "ReadioTTS"
+    max_chapter_characters: int = 500_000
     job_retention_days: int = Field(default=7, ge=1, le=365)
 
     gpt_base_url: str = "http://127.0.0.1:9880"
@@ -22,6 +25,7 @@ class Settings(BaseSettings):
     gpt_model_revision: str = "v2ProPlus"
     gpt_timeout_seconds: float = 300.0
     gpt_reference_dir: Path = Path("references/gpt")
+    gpt_job_data_remote_dir: str = "job-data/jobs"
     gpt_text_lang: str = "zh"
     gpt_prompt_lang: str = "zh"
     gpt_text_split_method: str = "cut0"

@@ -45,10 +45,9 @@ class CreateJobRequest(BaseModel):
 
 class JobState(StrEnum):
     QUEUED = "queued"
-    PROCESSING = "processing"
-    COMPLETED = "completed"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
     FAILED = "failed"
-    CANCELLED = "cancelled"
 
 
 class ManifestSentence(BaseModel):
@@ -68,23 +67,23 @@ class ChapterManifest(BaseModel):
     sentences: list[ManifestSentence]
 
 
-class PersistedJobState(BaseModel):
+class JobRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     job_id: str
     idempotency_key: str
-    synthesis_signature: str | None = None
+    chapter_id: str
+    voice_id: str
+    model_revision: str
     state: JobState
+    total_sentences: int
+    completed_sentences: int = 0
     created_at: datetime
     updated_at: datetime
-    sentences_completed: int = 0
+    heartbeat_at: datetime | None = None
     audio_size_bytes: int | None = None
     audio_sha256: str | None = None
     error: str | None = None
-
-
-class JobRecord(PersistedJobState):
-    request: CreateJobRequest
 
 
 class CreateJobResponse(BaseModel):
@@ -113,5 +112,6 @@ class JobResponse(BaseModel):
     progress: JobProgress
     created_at: datetime
     updated_at: datetime
+    heartbeat_at: datetime | None = None
     artifact: JobArtifact | None = None
     error: str | None = None

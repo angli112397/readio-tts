@@ -1,41 +1,50 @@
 name: readio-tts
 
+x-service-common: &service-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  init: true
+  environment: &gateway-environment
+    READIO_PROVIDER: ${READIO_PROVIDER:-gpt}
+    READIO_DATA_DIR: /app/data
+    READIO_MAX_CHAPTER_CHARACTERS: ${READIO_MAX_CHAPTER_CHARACTERS:-500000}
+    READIO_JOB_RETENTION_DAYS: ${READIO_JOB_RETENTION_DAYS:-7}
+    READIO_GPT_BASE_URL: ${READIO_GPT_BASE_URL:-http://gpt-sovits:9880}
+    READIO_GPT_MODEL_REVISION: ${READIO_GPT_MODEL_REVISION:-v2ProPlus}
+    READIO_GPT_TIMEOUT_SECONDS: ${READIO_GPT_TIMEOUT_SECONDS:-300}
+    READIO_GPT_REFERENCE_DIR: /app/references/gpt
+    READIO_GPT_JOB_DATA_REMOTE_DIR: job-data/jobs
+    READIO_GPT_TEXT_LANG: ${READIO_GPT_TEXT_LANG:-zh}
+    READIO_GPT_PROMPT_LANG: ${READIO_GPT_PROMPT_LANG:-zh}
+    READIO_GPT_TEXT_SPLIT_METHOD: ${READIO_GPT_TEXT_SPLIT_METHOD:-cut0}
+    READIO_GPT_BATCH_SIZE: ${READIO_GPT_BATCH_SIZE:-1}
+    READIO_GPT_TOP_K: ${READIO_GPT_TOP_K:-15}
+    READIO_GPT_TOP_P: ${READIO_GPT_TOP_P:-1.0}
+    READIO_GPT_TEMPERATURE: ${READIO_GPT_TEMPERATURE:-1.0}
+    READIO_GPT_SPEED_FACTOR: ${READIO_GPT_SPEED_FACTOR:-1.0}
+    READIO_GPT_FRAGMENT_INTERVAL: ${READIO_GPT_FRAGMENT_INTERVAL:-0.3}
+    READIO_GPT_SEED: ${READIO_GPT_SEED:--1}
+  volumes:
+    - ${READIO_DATA_DIR:?Set READIO_DATA_DIR to a local non-synchronized folder}:/app/data
+  read_only: true
+  tmpfs:
+    - /tmp
+  security_opt:
+    - no-new-privileges:true
+  networks:
+    - backend
+
 services:
   gateway:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    init: true
-    environment:
-      READIO_PROVIDER: ${READIO_PROVIDER:-gpt}
-      READIO_STORAGE_DIR: /app/data/jobs
-      READIO_MAX_CHAPTER_CHARACTERS: ${READIO_MAX_CHAPTER_CHARACTERS:-200000}
-      READIO_JOB_RETENTION_DAYS: ${READIO_JOB_RETENTION_DAYS:-7}
-      READIO_GPT_BASE_URL: ${READIO_GPT_BASE_URL:-http://gpt-sovits:9880}
-      READIO_GPT_MODEL_REVISION: ${READIO_GPT_MODEL_REVISION:-v2ProPlus}
-      READIO_GPT_TIMEOUT_SECONDS: ${READIO_GPT_TIMEOUT_SECONDS:-300}
-      READIO_GPT_REFERENCE_DIR: /app/references/gpt
-      READIO_GPT_TEXT_LANG: ${READIO_GPT_TEXT_LANG:-zh}
-      READIO_GPT_PROMPT_LANG: ${READIO_GPT_PROMPT_LANG:-zh}
-      READIO_GPT_TEXT_SPLIT_METHOD: ${READIO_GPT_TEXT_SPLIT_METHOD:-cut0}
-      READIO_GPT_BATCH_SIZE: ${READIO_GPT_BATCH_SIZE:-1}
-      READIO_GPT_TOP_K: ${READIO_GPT_TOP_K:-15}
-      READIO_GPT_TOP_P: ${READIO_GPT_TOP_P:-1.0}
-      READIO_GPT_TEMPERATURE: ${READIO_GPT_TEMPERATURE:-1.0}
-      READIO_GPT_SPEED_FACTOR: ${READIO_GPT_SPEED_FACTOR:-1.0}
-      READIO_GPT_FRAGMENT_INTERVAL: ${READIO_GPT_FRAGMENT_INTERVAL:-0.3}
-      READIO_GPT_SEED: ${READIO_GPT_SEED:--1}
+    <<: *service-common
+    volumes:
+      - ${READIO_DATA_DIR:?Set READIO_DATA_DIR to a local non-synchronized folder}:/app/data
+      - ./references/gpt:/app/references/gpt:ro
+    command: ["uvicorn", "readio_tts.api:app", "--host", "0.0.0.0", "--port", "8090", "--workers", "1"]
     ports:
       - "${READIO_GATEWAY_BIND:-0.0.0.0}:${READIO_GATEWAY_PORT:-8090}:8090"
-    volumes:
-      - jobs:/app/data/jobs
-      - ./references/gpt:/app/references/gpt
-    read_only: true
-    tmpfs:
-      - /tmp
-    security_opt:
-      - no-new-privileges:true
     healthcheck:
       test:
         - CMD
@@ -50,10 +59,11 @@ services:
       - backend
       - ingress
 
+  worker:
+    <<: *service-common
+    command: ["python", "-m", "readio_tts.worker"]
+
 networks:
   backend:
     internal: true
   ingress:
-
-volumes:
-  jobs:

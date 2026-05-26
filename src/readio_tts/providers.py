@@ -1,6 +1,4 @@
 from io import BytesIO
-import hashlib
-import json
 import math
 import struct
 from dataclasses import dataclass
@@ -15,14 +13,8 @@ from .config import Settings
 
 
 class SpeechProvider(Protocol):
-    async def synthesize(self, text: str, voice_id: str) -> bytes:
+    async def synthesize(self, text: str, job_id: str) -> bytes:
         """Return one uncompressed PCM WAV utterance."""
-
-    async def is_available(self) -> bool:
-        """Report whether synthesis requests can currently be accepted."""
-
-    async def synthesis_signature(self, voice_id: str) -> str:
-        """Identify inputs which must stay stable across a resumable job."""
 
     async def close(self) -> None:
         """Release any resources owned by the provider."""
@@ -34,7 +26,7 @@ class ReferenceProfile:
     prompt_text: str
 
 
-def _resolve_reference_profile(reference_dir: Path, voice_id: str) -> ReferenceProfile:
+def resolve_reference_profile(reference_dir: Path, voice_id: str) -> ReferenceProfile:
     if Path(voice_id).name != voice_id or voice_id in {".", ".."}:
         raise ValueError("Voice profile ID must be a single directory name.")
     profile_dir = reference_dir / voice_id
@@ -80,8 +72,8 @@ class GptSoVitsProvider:
     """Client for a self-hosted GPT-SoVITS api_v2 service."""
 
     def __init__(self, settings: Settings, client: httpx.AsyncClient | None = None) -> None:
-        self._reference_dir = settings.gpt_reference_dir
-        self._model_revision = settings.gpt_model_revision
+        self._jobs_dir = settings.data_dir / "jobs"
+        self._remote_jobs_dir = PurePosixPath(settings.gpt_job_data_remote_dir)
         self._options: dict[str, object] = {
             "text_lang": settings.gpt_text_lang,
             "prompt_lang": settings.gpt_prompt_lang,
@@ -106,9 +98,11 @@ class GptSoVitsProvider:
         )
         self._owns_client = client is None
 
-    async def synthesize(self, text: str, voice_id: str) -> bytes:
-        profile = self._resolve_profile(voice_id)
-        remote_audio_path = self._remote_reference_path(profile.audio_path)
+    async def synthesize(self, text: str, job_id: str) -> bytes:
+        profile = self._resolve_job_profile(job_id)
+        remote_audio_path = str(
+            self._remote_jobs_dir / job_id / "input" / profile.audio_path.name
+        )
         payload = {
             "text": text,
             "ref_audio_path": remote_audio_path,
@@ -122,32 +116,23 @@ class GptSoVitsProvider:
             raise ValueError("GPT-SoVITS returned a non-WAV response.")
         return response.content
 
-    async def is_available(self) -> bool:
-        try:
-            response = await self._client.get("/openapi.json")
-            return response.status_code == 200
-        except httpx.HTTPError:
-            return False
-
-    async def synthesis_signature(self, voice_id: str) -> str:
-        profile = self._resolve_profile(voice_id)
-        digest = hashlib.sha256()
-        digest.update(self._model_revision.encode("utf-8"))
-        digest.update(json.dumps(self._options, sort_keys=True).encode("utf-8"))
-        digest.update(profile.prompt_text.encode("utf-8"))
-        digest.update(profile.audio_path.read_bytes())
-        return digest.hexdigest()
-
     async def close(self) -> None:
         if self._owns_client:
             await self._client.aclose()
 
-    def _resolve_profile(self, voice_id: str) -> ReferenceProfile:
-        return _resolve_reference_profile(self._reference_dir, voice_id)
-
-    def _remote_reference_path(self, audio_path: Path) -> str:
-        relative_path = audio_path.relative_to(self._reference_dir).as_posix()
-        return str(PurePosixPath("references") / relative_path)
+    def _resolve_job_profile(self, job_id: str) -> ReferenceProfile:
+        input_dir = self._jobs_dir / job_id / "input"
+        audio = next(
+            (path for path in sorted(input_dir.iterdir()) if path.stem == "reference" and path.suffix != ".lab"),
+            None,
+        )
+        if audio is None:
+            raise ValueError(f"Job '{job_id}' is missing its reference audio snapshot.")
+        prompt_path = input_dir / "reference.lab"
+        return ReferenceProfile(
+            audio_path=audio,
+            prompt_text=prompt_path.read_text(encoding="utf-8").strip(),
+        )
 
 
 class MockSpeechProvider:
@@ -155,7 +140,7 @@ class MockSpeechProvider:
 
     frame_rate = 24_000
 
-    async def synthesize(self, text: str, voice_id: str) -> bytes:
+    async def synthesize(self, text: str, job_id: str) -> bytes:
         duration_ms = max(80, min(2_000, len(text) * 35))
         frame_count = round(self.frame_rate * duration_ms / 1000)
         frequency = 330
@@ -175,13 +160,6 @@ class MockSpeechProvider:
 
     async def close(self) -> None:
         return None
-
-    async def is_available(self) -> bool:
-        return True
-
-    async def synthesis_signature(self, voice_id: str) -> str:
-        return f"mock:{voice_id}"
-
 
 def create_provider(settings: Settings) -> SpeechProvider:
     if settings.provider == "gpt":

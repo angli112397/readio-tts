@@ -10,9 +10,9 @@ services:
     tty: true
     stdin_open: true
     volumes:
-      - ./references/gpt:/workspace/GPT-SoVITS/references
       - ./GPT-SoVITS:/workspace/GPT-SoVITS/GPT_SoVITS/pretrained_models
       - ./deployment/gpt_sovits/tts_infer.yaml:/run/readio/tts_infer.yaml:ro
+      - ${READIO_DATA_DIR:?Set READIO_DATA_DIR to a local non-synchronized folder}:/workspace/GPT-SoVITS/job-data:ro
     ports:
       - "${READIO_GPT_BIND:-127.0.0.1}:9880:9880"
     command:
@@ -33,10 +33,11 @@ services:
       - ingress
 
   gateway:
-    environment:
-      READIO_PROVIDER: gpt
-      READIO_GPT_BASE_URL: http://gpt-sovits:9880
-      READIO_GPT_REFERENCE_DIR: /app/references/gpt
+    depends_on:
+      gpt-sovits:
+        condition: service_started
+
+  worker:
     depends_on:
       gpt-sovits:
         condition: service_started

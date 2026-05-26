@@ -14,7 +14,28 @@ The service is intentionally designed around offline listening:
 
 ## Android API Contract
 
-The following endpoints form the complete public API.
+Android owns chapter text, sentence segmentation, downloaded artifacts, and
+offline playback. The gateway owns asynchronous synthesis and temporary
+server-side job data.
+
+The complete public API is:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/v1/jobs` | Submit one already-segmented chapter for synthesis. |
+| `GET` | `/v1/jobs/{job_id}` | Poll progress and obtain artifact URLs after success. |
+| `GET` | `/v1/jobs/{job_id}/audio` | Download the completed chapter WAV. |
+| `GET` | `/v1/jobs/{job_id}/manifest` | Download sentence timing metadata. |
+| `DELETE` | `/v1/jobs/{job_id}` | Cancel generation or remove downloaded/failed job data. |
+
+### Android Flow
+
+1. Android segments a chapter into stable sentence IDs and calls `POST /v1/jobs`.
+2. Android stores the returned `job_id` and periodically calls `GET /v1/jobs/{job_id}`.
+3. While the response state is `queued` or `running`, Android continues polling.
+4. When state is `succeeded`, Android downloads both `audio_url` and `manifest_url`.
+5. After both files are safely persisted locally, Android calls `DELETE /v1/jobs/{job_id}`.
+6. When state is `failed`, Android displays or logs `error`, then calls `DELETE`; a user retry is a new submission.
 
 ### Create A Job
 
@@ -58,6 +79,13 @@ Fields:
 
 Response: `202 Accepted`
 
+Headers:
+
+```http
+Location: http://192.168.1.6:8090/v1/jobs/f4a17b6a-9b1b-4bc2-b7f6-d87577835d53
+Retry-After: 5
+```
+
 ```json
 {
   "job_id": "f4a17b6a-9b1b-4bc2-b7f6-d87577835d53",
@@ -70,11 +98,29 @@ If the same `Idempotency-Key` is submitted with different content, the
 gateway returns `409 Conflict` rather than serving the wrong chapter artifact.
 Unknown JSON fields are rejected with `422`, so client and server contract
 drift is visible during development.
+The default `READIO_MAX_CHAPTER_CHARACTERS=500000` accommodates the tested
+full-volume workload of approximately `370000` characters.
 
 ### Poll Job Status
 
 ```http
 GET /v1/jobs/{job_id}
+```
+
+Queued response:
+
+```json
+{
+  "job_id": "f4a17b6a-9b1b-4bc2-b7f6-d87577835d53",
+  "chapter_id": "book-1/chapter-12",
+  "state": "queued",
+  "progress": {
+    "sentences_completed": 0,
+    "sentences_total": 2210
+  },
+  "created_at": "2026-05-26T08:00:00Z",
+  "updated_at": "2026-05-26T08:00:00Z"
+}
 ```
 
 While processing:
@@ -83,13 +129,14 @@ While processing:
 {
   "job_id": "f4a17b6a-9b1b-4bc2-b7f6-d87577835d53",
   "chapter_id": "book-1/chapter-12",
-  "state": "processing",
+  "state": "running",
   "progress": {
     "sentences_completed": 384,
     "sentences_total": 2210
   },
   "created_at": "2026-05-26T08:00:00Z",
-  "updated_at": "2026-05-26T09:42:00Z"
+  "updated_at": "2026-05-26T09:42:00Z",
+  "heartbeat_at": "2026-05-26T09:42:00Z"
 }
 ```
 
@@ -99,7 +146,7 @@ When complete:
 {
   "job_id": "f4a17b6a-9b1b-4bc2-b7f6-d87577835d53",
   "chapter_id": "book-1/chapter-12",
-  "state": "completed",
+  "state": "succeeded",
   "progress": {
     "sentences_completed": 2210,
     "sentences_total": 2210
@@ -116,8 +163,26 @@ When complete:
 }
 ```
 
-Job states are `queued`, `processing`, `completed`, `failed`, and
-`cancelled`. Failed jobs include an `error` field.
+Failed response:
+
+```json
+{
+  "job_id": "f4a17b6a-9b1b-4bc2-b7f6-d87577835d53",
+  "chapter_id": "book-1/chapter-12",
+  "state": "failed",
+  "progress": {
+    "sentences_completed": 384,
+    "sentences_total": 2210
+  },
+  "created_at": "2026-05-26T08:00:00Z",
+  "updated_at": "2026-05-26T09:42:00Z",
+  "error": "GPT-SoVITS request failed after retry."
+}
+```
+
+`heartbeat_at` is the time of the most recent progress update while a job is
+running. Android may display it for diagnostics, but should determine task
+completion from `state`, not infer failure from heartbeat age.
 
 ### Download Artifacts
 
@@ -157,41 +222,81 @@ The manifest is intentionally separate from status polling:
 Android already owns sentence text, so the manifest carries only sentence
 identity and timing data.
 
-### Confirm Persistence And Cancel
+### Delete Or Cancel
 
-After Android has safely stored both artifacts:
-
-```http
-POST /v1/jobs/{job_id}/ack
-```
-
-Response: `204 No Content`. The gateway removes the temporary server-side job
-data immediately. Completed jobs that are never acknowledged expire after
-`READIO_JOB_RETENTION_DAYS`.
-
-To stop generation or discard an unneeded artifact:
+After Android has safely stored both artifacts, or when a user no longer wants
+the generation task:
 
 ```http
 DELETE /v1/jobs/{job_id}
 ```
 
-Response: `204 No Content`.
+Response: `204 No Content`. Deletion is idempotent and immediately removes
+the job record and its cached files. If a GPT-SoVITS sentence request is
+already running, that single request cannot be interrupted; its response is
+discarded when it returns.
+Successful jobs that are never deleted expire after
+`READIO_JOB_RETENTION_DAYS`.
 
-## Processing Model
+### Status Codes
 
-The gateway synthesizes one sentence at a time to retain deterministic
-sentence boundaries. It stores the immutable chapter request once in
-`request.json`, updates lightweight job progress in `job.json`, and stores
-internal sentence WAV checkpoints in `data/jobs/<job_id>/segments/`. On
-restart, queued or processing jobs are scheduled again and existing segment
-files are reused. Once the chapter WAV and manifest are published, the
-internal segment files are deleted.
+| Request | Status | Android Handling |
+| --- | --- | --- |
+| Valid `POST /v1/jobs` | `202` | Persist `job_id`, then begin polling. |
+| Repeated identical `Idempotency-Key` | `202` | Reuse the returned existing `job_id`. |
+| Reused key with different request body | `409` | Treat as an app bug or create an intentional new submission with a new key. |
+| Invalid body, missing voice, or invalid `voice_id` | `422` | Treat as request/configuration error; do not poll. |
+| Chapter exceeds server character limit | `413` | Split the chapter into separate offline artifacts. |
+| Unknown or deleted job queried | `404` | Remove stale local pending-job tracking. |
+| Audio or manifest requested before success | `409` | Continue polling job status. |
+| Any `DELETE /v1/jobs/{job_id}` | `204` | Consider server-side temporary data removed. |
 
-Each pending job persists a synthesis signature derived from the model
-revision, inference settings, prompt transcript, and reference audio. If the
-engine configuration or narrator sample changes before a job resumes, the
-gateway discards its partial sentence audio and regenerates the chapter with
-one consistent voice and model.
+## Job State Machine
+
+Android only needs four observable states:
+
+| State | Meaning | Android Action |
+| --- | --- | --- |
+| `queued` | Accepted and waiting for the single worker. | Continue polling. |
+| `running` | Worker is generating or finalizing the chapter. | Continue polling. |
+| `succeeded` | WAV and manifest are ready. | Download both, persist locally, then `DELETE`. |
+| `failed` | Generation stopped with a terminal error. | Show or log `error`, then `DELETE`; resubmit only if desired. |
+
+```mermaid
+stateDiagram-v2
+    [*] --> queued: POST /v1/jobs
+    queued --> running: worker claims job
+    running --> running: sentence checkpoint saved
+    running --> succeeded: audio and manifest published
+    running --> failed: synthesis or publication error
+    queued --> [*]: DELETE
+    running --> [*]: DELETE
+    succeeded --> [*]: DELETE after Android saves artifacts
+    failed --> [*]: DELETE
+```
+
+The worker retries one failed sentence synthesis call once. A worker restart
+does not create a new Android-visible state: a `queued` or `running` job
+continues from saved sentence WAV checkpoints when the single worker runs
+again.
+
+## Server Processing
+
+The API process stores task metadata in local SQLite and returns status
+queries; a separate single worker process performs GPU synthesis. The worker
+synthesizes one sentence at a time to retain deterministic sentence
+boundaries, storing sentence WAV checkpoints under
+`READIO_DATA_DIR/jobs/<job_id>/segments/`. On worker restart, any queued or
+running task resumes from its existing consecutive segment files.
+
+When a job is submitted, its selected reference audio and transcript are
+copied into `READIO_DATA_DIR/jobs/<job_id>/input/`. This snapshot prevents
+changes to `references/gpt/<voice_id>/` from changing a chapter midway
+through generation.
+
+Do not change the GPT-SoVITS model configuration while a job is running.
+Model upgrades should be applied after active jobs have finished or been
+deleted.
 
 The final format remains WAV because it preserves predictable seek timing for
 offline synchronized reading.
@@ -249,19 +354,35 @@ by Git.
 
 ## Local Development
 
-Start GPT-SoVITS in Docker and run the gateway with reload:
+Start GPT-SoVITS in Docker, then run the API and worker locally in separate
+terminals:
 
 ```powershell
 docker compose -f compose.yaml -f compose.gpt.yaml -f compose.gpt.dev.yaml up -d gpt-sovits
 .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
+$env:READIO_DATA_DIR = Join-Path $env:LOCALAPPDATA "ReadioTTS"
 uvicorn readio_tts.api:app --reload --host 0.0.0.0 --port 8090
 ```
+
+Second terminal:
+
+```powershell
+cd C:\Users\angli\OneDrive\Documents\readio-tts
+.\.venv\Scripts\Activate.ps1
+$env:READIO_DATA_DIR = Join-Path $env:LOCALAPPDATA "ReadioTTS"
+python -m readio_tts.worker
+```
+
+Keep `READIO_DATA_DIR` outside OneDrive or another synchronized folder. It
+contains SQLite metadata, reference snapshots, sentence checkpoints, and
+completed artifacts. Run exactly one worker for the single local GPU.
 
 Relevant `.env` values:
 
 ```dotenv
 READIO_PROVIDER=gpt
+READIO_DATA_DIR=C:/Users/angli/AppData/Local/ReadioTTS
 READIO_GPT_BASE_URL=http://127.0.0.1:9880
 READIO_GPT_MODEL_REVISION=v2ProPlus
 READIO_GPT_REFERENCE_DIR=references/gpt
@@ -273,7 +394,8 @@ Check readiness:
 Invoke-RestMethod -Uri http://127.0.0.1:8090/health
 ```
 
-The readiness check probes GPT-SoVITS metadata without generating audio.
+The gateway readiness check reports API availability. The worker reports
+GPT-SoVITS errors through the affected job state.
 
 ## Docker Deployment
 
@@ -281,8 +403,9 @@ The readiness check probes GPT-SoVITS metadata without generating audio.
 docker compose -f compose.yaml -f compose.gpt.yaml up -d --build
 ```
 
-Only the gateway is published to the laptop network. GPT-SoVITS stays behind
-the Docker network.
+The stack starts `gateway`, one `worker`, and `gpt-sovits`. Only the gateway
+is published to the laptop LAN; GPT-SoVITS is exposed on localhost for
+development access.
 
 ## Tests
 
