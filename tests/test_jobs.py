@@ -5,7 +5,7 @@ from pathlib import Path
 import readio_tts.jobs as jobs_module
 from readio_tts.jobs import JobManager, JobWorker
 from readio_tts.models import CreateJobRequest, JobState, SentenceRequest
-from readio_tts.providers import MockSpeechProvider
+from readio_tts.providers import MockSpeechProvider, SynthesisError
 from readio_tts.repository import JobRepository
 
 
@@ -162,7 +162,11 @@ def test_sentence_failure_retries_once_then_marks_job_failed(
 
         async def synthesize(self, text: str, job_id: str) -> bytes:
             self.calls += 1
-            raise RuntimeError("provider failed")
+            raise SynthesisError(
+                "tts_unavailable",
+                "GPT-SoVITS is unavailable.",
+                retryable=True,
+            )
 
     async def exercise() -> None:
         async def no_sleep(_seconds: float) -> None:
@@ -178,8 +182,37 @@ def test_sentence_failure_retries_once_then_marks_job_failed(
 
         assert failed is not None
         assert failed.state == JobState.FAILED
-        assert failed.error == "provider failed"
+        assert failed.error_code == "tts_unavailable"
+        assert failed.error_message == "GPT-SoVITS is unavailable."
+        assert failed.error_sentence_id == "s1"
         assert provider.calls == 2
+
+    asyncio.run(exercise())
+
+
+def test_non_retryable_sentence_failure_is_recorded_without_retry(tmp_path: Path) -> None:
+    class RejectedProvider(MockSpeechProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def synthesize(self, text: str, job_id: str) -> bytes:
+            self.calls += 1
+            raise SynthesisError(
+                "tts_request_rejected",
+                "GPT-SoVITS rejected the synthesis request: invalid prompt.",
+            )
+
+    async def exercise() -> None:
+        manager = make_manager(tmp_path)
+        job, _ = manager.create_job(make_request(), "rejected-job")
+        provider = RejectedProvider()
+        await JobWorker(manager, provider).run_once()
+        failed = manager.get_job(job.job_id)
+
+        assert failed is not None
+        assert failed.error_code == "tts_request_rejected"
+        assert failed.error_sentence_id == "s1"
+        assert provider.calls == 1
 
     asyncio.run(exercise())
 
@@ -193,5 +226,29 @@ def test_delete_succeeded_job_removes_artifacts_and_metadata(tmp_path: Path) -> 
 
         assert manager.get_job(job.job_id) is None
         assert not manager.files(job.job_id).root.exists()
+
+    asyncio.run(exercise())
+
+
+def test_artifact_publication_failure_is_reported_separately(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    def fail_publish(*_args, **_kwargs):
+        raise OSError("disk failure")
+
+    monkeypatch.setattr(jobs_module, "_publish_artifacts", fail_publish)
+
+    async def exercise() -> None:
+        manager = make_manager(tmp_path)
+        job, _ = manager.create_job(make_request(), "publication-failure")
+        await JobWorker(manager, MockSpeechProvider()).run_once()
+        failed = manager.get_job(job.job_id)
+
+        assert failed is not None
+        assert failed.state == JobState.FAILED
+        assert failed.error_code == "artifact_publication_failed"
+        assert failed.error_message == "Failed to publish the generated audio artifact."
+        assert failed.error_sentence_id is None
 
     asyncio.run(exercise())

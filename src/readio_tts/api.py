@@ -1,13 +1,17 @@
+import logging
 from typing import Annotated
 
-from fastapi import FastAPI, Header, HTTPException, Request, Response, status
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Header, Request, Response, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
 
 from .config import Settings
 from .jobs import ChapterTooLargeError, IdempotencyConflictError, JobManager
 from .models import (
     CreateJobRequest,
     CreateJobResponse,
+    ErrorInfo,
+    ErrorResponse,
     JobArtifact,
     JobProgress,
     JobRecord,
@@ -17,6 +21,7 @@ from .models import (
 from .repository import JobRepository
 
 
+logger = logging.getLogger(__name__)
 settings = Settings()
 manager = JobManager(
     repository=JobRepository(settings.data_dir / "readio.sqlite3"),
@@ -27,6 +32,51 @@ manager = JobManager(
     job_retention_days=settings.job_retention_days,
 )
 app = FastAPI(title="Readio TTS", version="0.3.0")
+
+
+class ApiError(Exception):
+    def __init__(self, status_code: int, code: str, message: str) -> None:
+        self.status_code = status_code
+        self.error = ErrorInfo(code=code, message=message)
+
+
+@app.exception_handler(ApiError)
+async def api_error_handler(_request: Request, exc: ApiError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=ErrorResponse(error=exc.error).model_dump(exclude_none=True),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(
+    _request: Request,
+    exc: RequestValidationError,
+) -> JSONResponse:
+    first = exc.errors()[0]
+    location = ".".join(str(part) for part in first["loc"] if part != "body")
+    field = location or "body"
+    message = f"Invalid {field}: {first['msg']}."
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        content=ErrorResponse(
+            error=ErrorInfo(code="invalid_request", message=message)
+        ).model_dump(exclude_none=True),
+    )
+
+
+@app.exception_handler(Exception)
+async def unexpected_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception("API request failed: method=%s path=%s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content=ErrorResponse(
+            error=ErrorInfo(
+                code="internal_error",
+                message="The server could not complete the request.",
+            )
+        ).model_dump(exclude_none=True),
+    )
 
 
 @app.get("/health")
@@ -44,11 +94,11 @@ async def create_job(
     try:
         job, _created = manager.create_job(request, idempotency_key)
     except ChapterTooLargeError as exc:
-        raise HTTPException(status_code=413, detail=str(exc)) from exc
+        raise ApiError(413, "chapter_too_large", str(exc)) from exc
     except IdempotencyConflictError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise ApiError(409, "idempotency_conflict", str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise ApiError(422, "invalid_voice_profile", str(exc)) from exc
     status_url = _absolute_url(http_request, f"/v1/jobs/{job.job_id}")
     response.headers["Location"] = status_url
     response.headers["Retry-After"] = "5"
@@ -78,7 +128,15 @@ async def get_job(job_id: str, request: Request) -> JobResponse:
         updated_at=job.updated_at,
         heartbeat_at=job.heartbeat_at,
         artifact=artifact,
-        error=job.error,
+        error=(
+            ErrorInfo(
+                code=job.error_code,
+                message=job.error_message,
+                sentence_id=job.error_sentence_id,
+            )
+            if job.error_code and job.error_message
+            else None
+        ),
     )
 
 
@@ -87,7 +145,7 @@ async def get_audio(job_id: str) -> FileResponse:
     job = _require_succeeded_job(job_id)
     audio_path = manager.files(job.job_id).audio
     if not audio_path.exists():
-        raise HTTPException(status_code=404, detail="Audio artifact not found.")
+        raise ApiError(404, "artifact_not_found", "Audio artifact not found.")
     return FileResponse(audio_path, media_type="audio/wav", filename=f"{job_id}.wav")
 
 
@@ -96,7 +154,7 @@ async def get_manifest(job_id: str) -> FileResponse:
     job = _require_succeeded_job(job_id)
     manifest_path = manager.files(job.job_id).manifest
     if not manifest_path.exists():
-        raise HTTPException(status_code=404, detail="Manifest artifact not found.")
+        raise ApiError(404, "artifact_not_found", "Manifest artifact not found.")
     return FileResponse(manifest_path, media_type="application/json", filename="manifest.json")
 
 
@@ -109,14 +167,14 @@ async def delete_job(job_id: str) -> Response:
 def _require_job(job_id: str) -> JobRecord:
     job = manager.get_job(job_id)
     if job is None:
-        raise HTTPException(status_code=404, detail="Job not found.")
+        raise ApiError(404, "job_not_found", "Job not found.")
     return job
 
 
 def _require_succeeded_job(job_id: str) -> JobRecord:
     job = _require_job(job_id)
     if job.state != JobState.SUCCEEDED:
-        raise HTTPException(status_code=409, detail="Job artifact is not ready.")
+        raise ApiError(409, "artifact_not_ready", "Job artifact is not ready.")
     return job
 
 

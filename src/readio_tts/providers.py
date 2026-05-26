@@ -16,6 +16,14 @@ from .config import Settings
 logger = logging.getLogger(__name__)
 
 
+class SynthesisError(RuntimeError):
+    def __init__(self, code: str, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.retryable = retryable
+
+
 class SpeechProvider(Protocol):
     async def synthesize(self, text: str, job_id: str) -> bytes:
         """Return one uncompressed PCM WAV utterance."""
@@ -114,9 +122,17 @@ class GptSoVitsProvider:
             **self._options,
         }
 
-        response = await self._client.post("/tts", json=payload)
+        try:
+            response = await self._client.post("/tts", json=payload)
+        except httpx.HTTPError as exc:
+            logger.exception("GPT-SoVITS request failed to connect: job_id=%s", job_id)
+            raise SynthesisError(
+                "tts_unavailable",
+                "GPT-SoVITS is unavailable.",
+                retryable=True,
+            ) from exc
         if response.is_error:
-            detail = response.text.strip()[:500] or response.reason_phrase
+            detail = _response_detail(response)
             logger.error(
                 "GPT-SoVITS request failed: job_id=%s status=%s ref_audio_path=%s "
                 "text_preview=%r response=%s",
@@ -126,11 +142,21 @@ class GptSoVitsProvider:
                 text[:80],
                 detail,
             )
-            raise RuntimeError(
-                f"GPT-SoVITS returned HTTP {response.status_code}: {detail}"
+            if response.status_code < 500:
+                raise SynthesisError(
+                    "tts_request_rejected",
+                    f"GPT-SoVITS rejected the synthesis request: {detail}",
+                )
+            raise SynthesisError(
+                "tts_unavailable",
+                "GPT-SoVITS failed while synthesizing audio.",
+                retryable=True,
             )
         if response.headers.get("content-type", "").split(";")[0] != "audio/wav":
-            raise ValueError("GPT-SoVITS returned a non-WAV response.")
+            raise SynthesisError(
+                "invalid_tts_response",
+                "GPT-SoVITS returned invalid audio data.",
+            )
         return response.content
 
     async def close(self) -> None:
@@ -139,17 +165,41 @@ class GptSoVitsProvider:
 
     def _resolve_job_profile(self, job_id: str) -> ReferenceProfile:
         input_dir = self._jobs_dir / job_id / "input"
+        if not input_dir.is_dir():
+            raise SynthesisError(
+                "reference_snapshot_missing",
+                "The job reference audio snapshot is missing.",
+            )
         audio = next(
             (path for path in sorted(input_dir.iterdir()) if path.stem == "reference" and path.suffix != ".lab"),
             None,
         )
         if audio is None:
-            raise ValueError(f"Job '{job_id}' is missing its reference audio snapshot.")
+            raise SynthesisError(
+                "reference_snapshot_missing",
+                "The job reference audio snapshot is missing.",
+            )
         prompt_path = input_dir / "reference.lab"
+        if not prompt_path.exists():
+            raise SynthesisError(
+                "reference_snapshot_missing",
+                "The job reference transcript snapshot is missing.",
+            )
         return ReferenceProfile(
             audio_path=audio,
             prompt_text=prompt_path.read_text(encoding="utf-8").strip(),
         )
+
+
+def _response_detail(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+        if isinstance(payload, dict) and isinstance(payload.get("message"), str):
+            return payload["message"][:200]
+    except ValueError:
+        pass
+    detail = " ".join(response.text.split())
+    return (detail or response.reason_phrase)[:200]
 
 
 class MockSpeechProvider:

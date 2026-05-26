@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from readio_tts.config import Settings
-from readio_tts.providers import GptSoVitsProvider
+from readio_tts.providers import GptSoVitsProvider, SynthesisError
 
 
 def test_gpt_sovits_uses_the_job_reference_snapshot(tmp_path: Path) -> None:
@@ -84,11 +84,14 @@ def test_gpt_sovits_failure_includes_response_detail_and_logs_path(
                 Settings(data_dir=tmp_path, gpt_job_data_remote_dir="job-data/jobs"),
                 client=client,
             )
-            with pytest.raises(
-                RuntimeError,
-                match="GPT-SoVITS returned HTTP 400: reference audio is not readable",
-            ):
+            with pytest.raises(SynthesisError) as raised:
                 await provider.synthesize("A short sentence.", "job-id")
+            assert raised.value.code == "tts_request_rejected"
+            assert not raised.value.retryable
+            assert (
+                str(raised.value)
+                == "GPT-SoVITS rejected the synthesis request: reference audio is not readable"
+            )
 
     with caplog.at_level(logging.ERROR, logger="readio_tts.providers"):
         asyncio.run(exercise())

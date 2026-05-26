@@ -83,7 +83,9 @@ class JobRecord(BaseModel):
     heartbeat_at: datetime | None = None
     audio_size_bytes: int | None = None
     audio_sha256: str | None = None
-    error: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    error_sentence_id: str | None = None
 
 
 class CreateJobResponse(BaseModel):
@@ -105,6 +107,16 @@ class JobArtifact(BaseModel):
     sha256: str
 
 
+class ErrorInfo(BaseModel):
+    code: str
+    message: str
+    sentence_id: str | None = None
+
+
+class ErrorResponse(BaseModel):
+    error: ErrorInfo
+
+
 class JobResponse(BaseModel):
     job_id: str
     chapter_id: str
@@ -114,4 +126,4 @@ class JobResponse(BaseModel):
     updated_at: datetime
     heartbeat_at: datetime | None = None
     artifact: JobArtifact | None = None
-    error: str | None = None
+    error: ErrorInfo | None = None

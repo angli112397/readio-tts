@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import logging
 import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -13,8 +14,11 @@ from .models import (
     JobState,
     ManifestSentence,
 )
-from .providers import SpeechProvider, resolve_reference_profile
+from .providers import SpeechProvider, SynthesisError, resolve_reference_profile
 from .repository import JobRepository
+
+
+logger = logging.getLogger(__name__)
 
 
 class ChapterTooLargeError(ValueError):
@@ -171,6 +175,8 @@ class JobWorker:
 
     async def process(self, record: JobRecord) -> None:
         files = self.manager.files(record.job_id)
+        publishing = False
+        active_sentence_id: str | None = None
         try:
             request = self.manager.load_request(record.job_id)
             files.segments.mkdir(parents=True, exist_ok=True)
@@ -180,7 +186,9 @@ class JobWorker:
             completed = _completed_segment_prefix(files.segments, record.total_sentences)
             record.state = JobState.RUNNING
             record.completed_sentences = completed
-            record.error = None
+            record.error_code = None
+            record.error_message = None
+            record.error_sentence_id = None
             self._touch(record)
 
             for index in range(completed, record.total_sentences):
@@ -188,6 +196,7 @@ class JobWorker:
                     self.manager.purge(record.job_id)
                     return
                 sentence = request.sentences[index]
+                active_sentence_id = sentence.id
                 audio = await self._synthesize_with_retry(sentence.text, record.job_id)
                 if self._cancelled(record.job_id):
                     self.manager.purge(record.job_id)
@@ -199,6 +208,7 @@ class JobWorker:
                 record.completed_sentences = index + 1
                 self._touch(record)
 
+            publishing = True
             size_bytes, digest = await asyncio.to_thread(
                 _publish_artifacts,
                 files,
@@ -212,16 +222,32 @@ class JobWorker:
             record.audio_sha256 = digest
             self._touch(record)
             await asyncio.to_thread(shutil.rmtree, files.segments, True)
-        except Exception as exc:
+        except SynthesisError as exc:
             files.partial_audio.unlink(missing_ok=True)
             record.state = JobState.FAILED
-            record.error = str(exc)
+            record.error_code = exc.code
+            record.error_message = exc.message
+            record.error_sentence_id = active_sentence_id
+            self._touch(record)
+        except Exception:
+            files.partial_audio.unlink(missing_ok=True)
+            logger.exception("Job failed unexpectedly: job_id=%s", record.job_id)
+            record.state = JobState.FAILED
+            if publishing:
+                record.error_code = "artifact_publication_failed"
+                record.error_message = "Failed to publish the generated audio artifact."
+            else:
+                record.error_code = "internal_error"
+                record.error_message = "Audio generation failed unexpectedly."
+            record.error_sentence_id = active_sentence_id if not publishing else None
             self._touch(record)
 
     async def _synthesize_with_retry(self, text: str, job_id: str) -> bytes:
         try:
             return await self.provider.synthesize(text, job_id)
-        except Exception:
+        except SynthesisError as exc:
+            if not exc.retryable:
+                raise
             await asyncio.sleep(2)
             return await self.provider.synthesize(text, job_id)
 

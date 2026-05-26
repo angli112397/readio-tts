@@ -18,8 +18,9 @@ class JobRepository:
                 INSERT INTO jobs (
                     job_id, idempotency_key, chapter_id, voice_id, model_revision,
                     state, total_sentences, completed_sentences, created_at,
-                    updated_at, heartbeat_at, audio_size_bytes, audio_sha256, error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    updated_at, heartbeat_at, audio_size_bytes, audio_sha256,
+                    error_code, error_message, error_sentence_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._values(record),
             )
@@ -61,7 +62,8 @@ class JobRepository:
                     idempotency_key = ?, chapter_id = ?, voice_id = ?,
                     model_revision = ?, state = ?, total_sentences = ?,
                     completed_sentences = ?, created_at = ?, updated_at = ?, heartbeat_at = ?,
-                    audio_size_bytes = ?, audio_sha256 = ?, error = ?
+                    audio_size_bytes = ?, audio_sha256 = ?, error_code = ?,
+                    error_message = ?, error_sentence_id = ?
                 WHERE job_id = ?
                 """,
                 (
@@ -77,7 +79,9 @@ class JobRepository:
                     _timestamp(record.heartbeat_at),
                     record.audio_size_bytes,
                     record.audio_sha256,
-                    record.error,
+                    record.error_code,
+                    record.error_message,
+                    record.error_sentence_id,
                     record.job_id,
                 ),
             )
@@ -126,10 +130,15 @@ class JobRepository:
                     heartbeat_at TEXT,
                     audio_size_bytes INTEGER,
                     audio_sha256 TEXT,
-                    error TEXT
+                    error_code TEXT,
+                    error_message TEXT,
+                    error_sentence_id TEXT
                 )
                 """
             )
+            self._add_column_if_missing(connection, "error_code", "TEXT")
+            self._add_column_if_missing(connection, "error_message", "TEXT")
+            self._add_column_if_missing(connection, "error_sentence_id", "TEXT")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._database_path, timeout=10)
@@ -159,7 +168,9 @@ class JobRepository:
             ),
             audio_size_bytes=row["audio_size_bytes"],
             audio_sha256=row["audio_sha256"],
-            error=row["error"],
+            error_code=row["error_code"],
+            error_message=row["error_message"],
+            error_sentence_id=row["error_sentence_id"],
         )
 
     @staticmethod
@@ -178,8 +189,23 @@ class JobRepository:
             _timestamp(record.heartbeat_at),
             record.audio_size_bytes,
             record.audio_sha256,
-            record.error,
+            record.error_code,
+            record.error_message,
+            record.error_sentence_id,
         )
+
+    @staticmethod
+    def _add_column_if_missing(
+        connection: sqlite3.Connection,
+        column: str,
+        definition: str,
+    ) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        if column not in columns:
+            connection.execute(f"ALTER TABLE jobs ADD COLUMN {column} {definition}")
 
 
 def _timestamp(value: datetime | None) -> str | None:

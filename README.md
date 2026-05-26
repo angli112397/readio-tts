@@ -1,18 +1,17 @@
 # Readio TTS
 
-`readio-tts` is a local asynchronous TTS gateway for an Android reading app.
-Android sends an already segmented chapter, GPT-SoVITS generates each
-sentence, and the gateway publishes one complete offline WAV file plus a
-sentence timing manifest.
+`readio-tts` is a local TTS gateway for an Android reading app. Android sends
+an already segmented chapter. The gateway generates one complete WAV file and
+a sentence timing manifest for offline playback.
 
-The service is intentionally designed around offline listening:
+The basic behavior is:
 
 - Android receives a complete chapter artifact that supports random seeking.
 - The gateway retains output only until Android confirms it has persisted it.
 - Sentence audio is checkpointed internally so an interrupted gateway can
   continue a long-running chapter instead of starting over.
 
-## Android API Contract
+## Android API
 
 Android owns chapter text, sentence segmentation, downloaded artifacts, and
 offline playback. The gateway owns asynchronous synthesis and temporary
@@ -28,7 +27,7 @@ The complete public API is:
 | `GET` | `/v1/jobs/{job_id}/manifest` | Download sentence timing metadata. |
 | `DELETE` | `/v1/jobs/{job_id}` | Cancel generation or remove downloaded/failed job data. |
 
-### Android Flow
+### Client Flow
 
 1. Android segments a chapter into stable sentence IDs and calls `POST /v1/jobs`.
 2. Android stores the returned `job_id` and periodically calls `GET /v1/jobs/{job_id}`.
@@ -176,13 +175,33 @@ Failed response:
   },
   "created_at": "2026-05-26T08:00:00Z",
   "updated_at": "2026-05-26T09:42:00Z",
-  "error": "GPT-SoVITS request failed after retry."
+  "error": {
+    "code": "tts_unavailable",
+    "message": "GPT-SoVITS is unavailable.",
+    "sentence_id": "s000385"
+  }
 }
 ```
 
 `heartbeat_at` is the time of the most recent progress update while a job is
 running. Android may display it for diagnostics, but should determine task
 completion from `state`, not infer failure from heartbeat age.
+
+All immediate HTTP failures use the same compact shape:
+
+```json
+{
+  "error": {
+    "code": "invalid_request",
+    "message": "Invalid sentences: Field required."
+  }
+}
+```
+
+Android should branch on `error.code` and use `error.message` for diagnostics
+or display. For sentence synthesis failures, `error.sentence_id` identifies
+the Android sentence that could not be generated. Detailed GPT request
+context is retained in server logs rather than returned to the device.
 
 ### Download Artifacts
 
@@ -251,7 +270,25 @@ Successful jobs that are never deleted expire after
 | Audio or manifest requested before success | `409` | Continue polling job status. |
 | Any `DELETE /v1/jobs/{job_id}` | `204` | Consider server-side temporary data removed. |
 
-## Job State Machine
+Error codes:
+
+| Code | Returned For | Android Handling |
+| --- | --- | --- |
+| `invalid_request` | Invalid JSON fields or missing required input. | Correct the request; do not poll. |
+| `invalid_voice_profile` | The selected local narrator is missing or invalid. | Prompt for another installed voice. |
+| `chapter_too_large` | Text exceeds the server size limit. | Split into separate artifacts. |
+| `idempotency_conflict` | A key was reused with different content. | Generate a new key for the new request. |
+| `job_not_found` | A queried job no longer exists. | Remove stale local tracking. |
+| `artifact_not_ready` | Download requested before `succeeded`. | Continue polling. |
+| `artifact_not_found` | A completed artifact is missing on disk. | Discard the job and resubmit if needed. |
+| `tts_request_rejected` | GPT-SoVITS rejected sentence/reference input. | Show/log the message; resubmit after fixing the input. |
+| `tts_unavailable` | GPT-SoVITS was unavailable after one retry. | Show/log failure; allow a new submission. |
+| `invalid_tts_response` | GPT-SoVITS returned unusable audio. | Show/log failure; allow a new submission. |
+| `reference_snapshot_missing` | Job-local narrator files are missing. | Delete the job and submit again. |
+| `artifact_publication_failed` | Final WAV or manifest could not be published. | Delete and submit again after checking storage. |
+| `internal_error` | Unexpected server failure. | Show/log failure and inspect server logs. |
+
+## Job States
 
 Android only needs four observable states:
 
@@ -262,23 +299,11 @@ Android only needs four observable states:
 | `succeeded` | WAV and manifest are ready. | Download both, persist locally, then `DELETE`. |
 | `failed` | Generation stopped with a terminal error. | Show or log `error`, then `DELETE`; resubmit only if desired. |
 
-```mermaid
-stateDiagram-v2
-    [*] --> queued: POST /v1/jobs
-    queued --> running: worker claims job
-    running --> running: sentence checkpoint saved
-    running --> succeeded: audio and manifest published
-    running --> failed: synthesis or publication error
-    queued --> [*]: DELETE
-    running --> [*]: DELETE
-    succeeded --> [*]: DELETE after Android saves artifacts
-    failed --> [*]: DELETE
-```
-
-The worker retries one failed sentence synthesis call once. A worker restart
-does not create a new Android-visible state: a `queued` or `running` job
-continues from saved sentence WAV checkpoints when the single worker runs
-again.
+The worker retries one sentence synthesis call once only for temporary
+GPT-SoVITS availability failures. Invalid input is failed immediately. A
+worker restart does not create a new Android-visible state: a `queued` or
+`running` job continues from saved sentence WAV checkpoints when the single
+worker runs again.
 
 ## Server Processing
 
