@@ -1,8 +1,10 @@
 import asyncio
 import json
+import logging
 from pathlib import Path
 
 import httpx
+import pytest
 
 from readio_tts.config import Settings
 from readio_tts.providers import GptSoVitsProvider
@@ -59,3 +61,36 @@ def test_gpt_sovits_uses_the_job_reference_snapshot(tmp_path: Path) -> None:
             "streaming_mode": False,
         }
     ]
+
+
+def test_gpt_sovits_failure_includes_response_detail_and_logs_path(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    input_dir = tmp_path / "jobs" / "job-id" / "input"
+    input_dir.mkdir(parents=True)
+    (input_dir / "reference.wav").write_bytes(b"wav-bytes")
+    (input_dir / "reference.lab").write_text("Prompt.", encoding="utf-8")
+
+    def handle(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text="reference audio is not readable")
+
+    async def exercise() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handle),
+            base_url="http://gpt-sovits",
+        ) as client:
+            provider = GptSoVitsProvider(
+                Settings(data_dir=tmp_path, gpt_job_data_remote_dir="job-data/jobs"),
+                client=client,
+            )
+            with pytest.raises(
+                RuntimeError,
+                match="GPT-SoVITS returned HTTP 400: reference audio is not readable",
+            ):
+                await provider.synthesize("A short sentence.", "job-id")
+
+    with caplog.at_level(logging.ERROR, logger="readio_tts.providers"):
+        asyncio.run(exercise())
+
+    assert "job-data/jobs/job-id/input/reference.wav" in caplog.text

@@ -334,6 +334,10 @@ The tracked runtime configuration is stored in
 `deployment/gpt_sovits/tts_infer.yaml`. GPT-SoVITS writes back to its runtime
 config while initializing, so Compose copies this template to a writable
 temporary file inside the container before starting the API server.
+The startup script in `deployment/gpt_sovits/start-api.sh` exposes the
+`G2PWModel` already bundled in the upstream image at GPT-SoVITS's expected
+Chinese frontend path. This avoids both an additional local model copy and a
+first-request model download.
 
 Start GPT-SoVITS:
 

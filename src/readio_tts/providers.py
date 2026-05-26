@@ -1,4 +1,5 @@
 from io import BytesIO
+import logging
 import math
 import struct
 from dataclasses import dataclass
@@ -10,6 +11,9 @@ import wave
 import httpx
 
 from .config import Settings
+
+
+logger = logging.getLogger(__name__)
 
 
 class SpeechProvider(Protocol):
@@ -111,7 +115,20 @@ class GptSoVitsProvider:
         }
 
         response = await self._client.post("/tts", json=payload)
-        response.raise_for_status()
+        if response.is_error:
+            detail = response.text.strip()[:500] or response.reason_phrase
+            logger.error(
+                "GPT-SoVITS request failed: job_id=%s status=%s ref_audio_path=%s "
+                "text_preview=%r response=%s",
+                job_id,
+                response.status_code,
+                remote_audio_path,
+                text[:80],
+                detail,
+            )
+            raise RuntimeError(
+                f"GPT-SoVITS returned HTTP {response.status_code}: {detail}"
+            )
         if response.headers.get("content-type", "").split(";")[0] != "audio/wav":
             raise ValueError("GPT-SoVITS returned a non-WAV response.")
         return response.content

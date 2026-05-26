@@ -12,15 +12,11 @@ services:
     volumes:
       - ./GPT-SoVITS:/workspace/GPT-SoVITS/GPT_SoVITS/pretrained_models
       - ./deployment/gpt_sovits/tts_infer.yaml:/run/readio/tts_infer.yaml:ro
+      - ./deployment/gpt_sovits/start-api.sh:/run/readio/start-api.sh:ro
       - ${READIO_DATA_DIR:?Set READIO_DATA_DIR to a local non-synchronized folder}:/workspace/GPT-SoVITS/job-data:ro
     ports:
       - "${READIO_GPT_BIND:-127.0.0.1}:9880:9880"
-    command:
-      - bash
-      - -lc
-      - >-
-        cp /run/readio/tts_infer.yaml /tmp/readio_tts_infer.yaml
-        && exec python api_v2.py -a 0.0.0.0 -p 9880 -c /tmp/readio_tts_infer.yaml
+    command: ["bash", "/run/readio/start-api.sh"]
     deploy:
       resources:
         reservations:
