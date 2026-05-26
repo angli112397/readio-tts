@@ -1,4 +1,4 @@
-"""Extract Fish Speech reference pairs from CSEMOTIONS parquet shards."""
+"""Extract reference pairs from CSEMOTIONS parquet shards."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ REQUIRED_COLUMNS = ("audio", "emotion")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Extract CSEMOTIONS audio and transcripts for Fish Speech.",
+        description="Extract CSEMOTIONS audio and transcripts for local reference profiles.",
     )
     parser.add_argument(
         "parquet",
@@ -88,7 +88,7 @@ def main() -> int:
         count=args.count,
         overwrite=args.overwrite,
     )
-    print(f"Extracted {len(written)} Fish Speech reference pair(s) to {args.output}.")
+    print(f"Extracted {len(written)} reference pair(s) to {args.output}.")
     for wav_path, lab_path in written:
         print(f"  {wav_path.name} + {lab_path.name}")
     return 0

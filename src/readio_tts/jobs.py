@@ -40,8 +40,6 @@ class ChapterJobService:
 
     async def create_job(self, request: CreateChapterJobRequest) -> ChapterJobResponse:
         self._cleanup_expired_jobs()
-        if request.reqid is not None and self._has_request_id(request.reqid):
-            raise ValueError(f"Request ID has already been submitted: {request.reqid}.")
         character_count = sum(len(sentence) for sentence in request.sentences)
         if character_count > self._max_chapter_characters:
             raise ValueError(
@@ -51,7 +49,6 @@ class ChapterJobService:
 
         job = ChapterJobResponse(
             job_id=str(uuid4()),
-            reqid=request.reqid,
             status=JobStatus.QUEUED,
             created_at=datetime.now(UTC),
             sentence_count=len(request.sentences),
@@ -288,17 +285,3 @@ class ChapterJobService:
 
         for job_id in expired_job_ids:
             self._jobs.pop(job_id, None)
-
-    def _has_request_id(self, reqid: str) -> bool:
-        if any(job.reqid == reqid for job in self._jobs.values()):
-            return True
-        for state_path in self._storage_dir.glob(f"*/{self._STATE_FILENAME}"):
-            try:
-                job = ChapterJobResponse.model_validate_json(
-                    state_path.read_text(encoding="utf-8")
-                )
-            except (OSError, ValueError, json.JSONDecodeError):
-                continue
-            if job.reqid == reqid:
-                return True
-        return False

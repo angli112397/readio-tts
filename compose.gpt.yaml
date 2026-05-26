@@ -1,0 +1,44 @@
+services:
+  gpt-sovits:
+    image: ${READIO_GPT_IMAGE:-xxxxrt666/gpt-sovits:cu126-lite-20250616-7dec5f}
+    restart: unless-stopped
+    init: true
+    working_dir: /workspace/GPT-SoVITS
+    environment:
+      is_half: "true"
+    shm_size: "16g"
+    tty: true
+    stdin_open: true
+    volumes:
+      - ./references/gpt:/workspace/GPT-SoVITS/references
+      - ./GPT-SoVITS:/workspace/GPT-SoVITS/GPT_SoVITS/pretrained_models
+    ports:
+      - "${READIO_GPT_BIND:-127.0.0.1}:9880:9880"
+    command:
+      - python
+      - api_v2.py
+      - -a
+      - 0.0.0.0
+      - -p
+      - "9880"
+      - -c
+      - GPT_SoVITS/configs/tts_infer.yaml
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - backend
+      - ingress
+
+  gateway:
+    environment:
+      READIO_PROVIDER: gpt
+      READIO_GPT_BASE_URL: http://gpt-sovits:9880
+      READIO_GPT_REFERENCE_DIR: /app/references/gpt
+    depends_on:
+      gpt-sovits:
+        condition: service_started

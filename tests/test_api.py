@@ -38,8 +38,6 @@ def test_async_submit_and_query_follow_android_contract(
         created = client.post(
             "/api/v1/tts_async/submit",
             json={
-                "appid": "123456",
-                "reqid": "android-request-00000001",
                 "sentences": ["火山引擎异步长文本合成。", "第二句。"],
                 "format": "wav",
                 "enable_subtitle": 1,
@@ -52,7 +50,7 @@ def test_async_submit_and_query_follow_android_contract(
 
         status_response = client.get(
             "/api/v1/tts_async/query",
-            params={"appid": "123456", "task_id": task_id},
+            params={"task_id": task_id},
         )
         assert status_response.status_code == 200
         payload = status_response.json()
@@ -83,8 +81,6 @@ def test_client_can_override_sentence_interval(tmp_path: Path, monkeypatch) -> N
         created = client.post(
             "/api/v1/tts_async/submit",
             json={
-                "appid": "123456",
-                "reqid": "android-request-00000002",
                 "sentences": ["One.", "Two."],
                 "sentence_interval": 275,
             },
@@ -93,12 +89,15 @@ def test_client_can_override_sentence_interval(tmp_path: Path, monkeypatch) -> N
 
         result = client.get(
             "/api/v1/tts_async/query",
-            params={"appid": "123456", "task_id": created.json()["task_id"]},
+            params={"task_id": created.json()["task_id"]},
         ).json()
         assert result["sentences"][1]["begin_time"] - result["sentences"][0]["end_time"] == 275
 
 
-def test_duplicate_reqid_does_not_create_a_second_task(tmp_path: Path, monkeypatch) -> None:
+def test_appid_and_reqid_are_optional_and_have_no_task_identity_effect(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     monkeypatch.setattr(
         api,
         "jobs",
@@ -114,9 +113,9 @@ def test_duplicate_reqid_does_not_create_a_second_task(tmp_path: Path, monkeypat
         first = client.post("/api/v1/tts_async/submit", json=payload)
         second = client.post("/api/v1/tts_async/submit", json=payload)
 
-    assert first.json()["task_id"]
-    assert second.json()["code"] == 40000
-    assert second.json()["reqid"] == payload["reqid"]
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["task_id"] != second.json()["task_id"]
 
 
 def test_rejects_out_of_range_sentence_interval(tmp_path: Path, monkeypatch) -> None:
@@ -130,8 +129,6 @@ def test_rejects_out_of_range_sentence_interval(tmp_path: Path, monkeypatch) -> 
         response = client.post(
             "/api/v1/tts_async/submit",
             json={
-                "appid": "123456",
-                "reqid": "android-request-00000003",
                 "sentences": ["One."],
                 "sentence_interval": 3_001,
             },
@@ -139,7 +136,7 @@ def test_rejects_out_of_range_sentence_interval(tmp_path: Path, monkeypatch) -> 
 
     assert response.status_code == 400
     assert response.json()["code"] == 40000
-    assert response.json()["reqid"] == "android-request-00000003"
+    assert "reqid" not in response.json()
 
 
 def test_raw_text_submission_is_rejected_without_android_sentences(
@@ -156,8 +153,6 @@ def test_raw_text_submission_is_rejected_without_android_sentences(
         response = client.post(
             "/api/v1/tts_async/submit",
             json={
-                "appid": "123456",
-                "reqid": "android-request-00000004",
                 "text": "No splitting here.",
             },
         )
@@ -180,8 +175,6 @@ def test_unsupported_optional_synthesis_parameters_are_ignored(
         response = client.post(
             "/api/v1/tts_async/submit",
             json={
-                "appid": "123456",
-                "reqid": "android-request-00000005",
                 "sentences": ["One."],
                 "format": "wav",
                 "enable_subtitle": 1,
@@ -192,6 +185,35 @@ def test_unsupported_optional_synthesis_parameters_are_ignored(
         )
 
     assert response.status_code == 200
+
+
+def test_optional_appid_and_reqid_are_accepted_with_wav_output(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        api,
+        "jobs",
+        ChapterJobService(MockSpeechProvider(), tmp_path, 1_000),
+    )
+
+    with TestClient(api.app) as client:
+        response = client.post(
+            "/api/v1/tts_async/submit",
+            json={
+                "appid": "legacy-app",
+                "reqid": "legacy-request-id",
+                "sentences": ["One."],
+            },
+        )
+        result = client.get(
+            "/api/v1/tts_async/query",
+            params={"appid": "legacy-app", "task_id": response.json()["task_id"]},
+        ).json()
+        audio = client.get(result["audio_url"])
+
+    assert response.status_code == 200
+    assert audio.headers["content-type"] == "audio/wav"
 
 
 def test_only_wav_and_sentence_subtitles_are_supported(tmp_path: Path, monkeypatch) -> None:
@@ -205,8 +227,6 @@ def test_only_wav_and_sentence_subtitles_are_supported(tmp_path: Path, monkeypat
         mp3 = client.post(
             "/api/v1/tts_async/submit",
             json={
-                "appid": "123456",
-                "reqid": "android-request-00000006",
                 "sentences": ["One."],
                 "format": "mp3",
             },
@@ -214,8 +234,6 @@ def test_only_wav_and_sentence_subtitles_are_supported(tmp_path: Path, monkeypat
         words = client.post(
             "/api/v1/tts_async/submit",
             json={
-                "appid": "123456",
-                "reqid": "android-request-00000007",
                 "sentences": ["One."],
                 "enable_subtitle": 2,
             },
@@ -237,8 +255,6 @@ def test_removed_alias_routes_are_not_available(tmp_path: Path, monkeypatch) -> 
         emotion = client.post(
             "/api/v1/tts_async_with_emotion/submit",
             json={
-                "appid": "123456",
-                "reqid": "android-request-00000009",
                 "sentences": ["One."],
             },
         )
@@ -262,12 +278,11 @@ def test_unknown_or_invalid_task_identifier_is_not_found(tmp_path: Path, monkeyp
     with TestClient(api.app) as client:
         response = client.get(
             "/api/v1/tts_async/query",
-            params={"appid": "123456", "task_id": "not-a-job-id"},
+            params={"task_id": "not-a-job-id"},
         )
 
     assert response.status_code == 200
     assert response.json() == {
-        "reqid": "not-a-job-id",
         "code": 40400,
         "message": "Task does not exist or has expired.",
     }
@@ -284,8 +299,6 @@ def test_expired_audio_url_is_rejected(tmp_path: Path, monkeypatch) -> None:
         created = client.post(
             "/api/v1/tts_async/submit",
             json={
-                "appid": "123456",
-                "reqid": "android-request-00000008",
                 "sentences": ["One."],
             },
         )

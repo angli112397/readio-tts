@@ -12,21 +12,25 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    provider: Literal["mock", "fish"] = "mock"
+    provider: Literal["mock", "gpt"] = "gpt"
     storage_dir: Path = Path("data/jobs")
     max_chapter_characters: int = 200_000
     sentence_gap_ms: int = Field(default=600, ge=0, le=5_000)
     job_retention_days: int = Field(default=7, ge=1, le=365)
     audio_url_signing_key: str = Field(default="replace-for-non-local-use", min_length=16)
 
-    fish_base_url: str = "http://127.0.0.1:8080"
-    fish_api_key: str | None = None
-    fish_reference_id: str | None = None
-    fish_timeout_seconds: float = 300.0
-    fish_chunk_length: int = Field(default=200, ge=100, le=300)
-    fish_max_new_tokens: int = Field(default=1024, ge=1)
-    fish_top_p: float = Field(default=0.7, ge=0.1, le=1.0)
-    fish_temperature: float = Field(default=0.7, ge=0.1, le=1.0)
-    fish_repetition_penalty: float = Field(default=1.2, ge=0.9, le=2.0)
-    fish_normalize: bool = True
-    fish_use_memory_cache: Literal["on", "off"] = "on"
+    gpt_base_url: str = "http://127.0.0.1:9880"
+    gpt_api_key: str | None = None
+    gpt_timeout_seconds: float = 300.0
+    gpt_reference_dir: Path = Path("references/gpt")
+    gpt_default_reference_id: str | None = None
+    gpt_text_lang: str = "zh"
+    gpt_prompt_lang: str = "zh"
+    gpt_text_split_method: str = "cut0"
+    gpt_batch_size: int = Field(default=1, ge=1, le=16)
+    gpt_top_k: int = Field(default=15, ge=1, le=100)
+    gpt_top_p: float = Field(default=1.0, ge=0.1, le=1.0)
+    gpt_temperature: float = Field(default=1.0, ge=0.1, le=2.0)
+    gpt_speed_factor: float = Field(default=1.0, ge=0.25, le=3.0)
+    gpt_fragment_interval: float = Field(default=0.3, ge=0.0, le=3.0)
+    gpt_seed: int = Field(default=-1, ge=-1)

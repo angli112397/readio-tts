@@ -1,77 +1,92 @@
 import asyncio
 import json
+from pathlib import Path
 
 import httpx
 
 from readio_tts.config import Settings
-from readio_tts.providers import FishSpeechProvider
+from readio_tts.providers import GptSoVitsProvider
 
 
-def test_fish_speech_v15_request_uses_local_server_options() -> None:
-    requests: list[dict[str, object]] = []
+def test_gpt_sovits_availability_does_not_run_synthesis(tmp_path: Path) -> None:
+    requests: list[tuple[str, str]] = []
 
     def handle(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/health":
-            return httpx.Response(200, json={"status": "ok"})
-        requests.append(json.loads(request.content))
-        return httpx.Response(200, headers={"content-type": "audio/wav"}, content=b"wav")
+        requests.append((request.method, request.url.path))
+        if request.url.path == "/openapi.json":
+            return httpx.Response(200, json={"openapi": "3.1.0"})
+        return httpx.Response(500)
 
     async def exercise() -> None:
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(handle),
-            base_url="http://fish-speech",
+            base_url="http://gpt-sovits",
         ) as client:
-            provider = FishSpeechProvider(
+            provider = GptSoVitsProvider(
                 Settings(
-                    fish_reference_id="narrator",
-                    fish_chunk_length=180,
-                    fish_use_memory_cache="on",
+                    provider="gpt",
+                    gpt_reference_dir=tmp_path / "does-not-need-to-exist",
                 ),
                 client=client,
             )
             assert await provider.is_available()
-            audio = await provider.synthesize("Hello.")
+
+    asyncio.run(exercise())
+
+    assert requests == [("GET", "/openapi.json")]
+
+
+def test_gpt_sovits_request_uses_reference_profile_files(tmp_path: Path) -> None:
+    requests: list[dict[str, object]] = []
+    reference_dir = tmp_path / "references" / "mandarin_reader"
+    reference_dir.mkdir(parents=True)
+    (reference_dir / "sample.wav").write_bytes(b"wav-bytes")
+    (reference_dir / "sample.lab").write_text("你好，世界。", encoding="utf-8")
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/tts":
+            payload = json.loads(request.content)
+            requests.append(payload)
+            return httpx.Response(200, headers={"content-type": "audio/wav"}, content=b"wav")
+        return httpx.Response(404)
+
+    async def exercise() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handle),
+            base_url="http://gpt-sovits",
+        ) as client:
+            provider = GptSoVitsProvider(
+                Settings(
+                    provider="gpt",
+                    gpt_reference_dir=tmp_path / "references",
+                    gpt_default_reference_id="mandarin_reader",
+                    gpt_text_lang="zh",
+                    gpt_prompt_lang="zh",
+                    gpt_text_split_method="cut0",
+                ),
+                client=client,
+            )
+            audio = await provider.synthesize("第一句。")
             assert audio == b"wav"
 
     asyncio.run(exercise())
 
     assert requests == [
         {
-            "text": "Hello.",
-            "format": "wav",
-            "streaming": False,
-            "normalize": True,
-            "chunk_length": 180,
-            "max_new_tokens": 1024,
-            "top_p": 0.7,
-            "temperature": 0.7,
-            "repetition_penalty": 1.2,
-            "use_memory_cache": "on",
-            "reference_id": "narrator",
+            "text": "第一句。",
+            "ref_audio_path": "references/mandarin_reader/sample.wav",
+            "prompt_text": "你好，世界。",
+            "text_lang": "zh",
+            "prompt_lang": "zh",
+            "text_split_method": "cut0",
+            "batch_size": 1,
+            "top_k": 15,
+            "top_p": 1.0,
+            "temperature": 1.0,
+            "speed_factor": 1.0,
+            "fragment_interval": 0.3,
+            "seed": -1,
+            "media_type": "wav",
+            "streaming_mode": False,
         }
     ]
-
-
-def test_fish_speech_rejects_non_audio_response() -> None:
-    async def exercise() -> None:
-        client = httpx.AsyncClient(
-            transport=httpx.MockTransport(
-                lambda request: httpx.Response(
-                    200,
-                    headers={"content-type": "application/json"},
-                    content=b"{}",
-                )
-            ),
-            base_url="http://fish-speech",
-        )
-        provider = FishSpeechProvider(Settings(), client=client)
-        try:
-            await provider.synthesize("Hello.")
-        except ValueError as exc:
-            assert "non-WAV" in str(exc)
-        else:
-            raise AssertionError("Expected a non-audio Fish Speech response to fail.")
-        finally:
-            await client.aclose()
-
-    asyncio.run(exercise())

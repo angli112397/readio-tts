@@ -55,9 +55,7 @@ async def request_validation_error(
     exc: RequestValidationError,
 ) -> JSONResponse:
     if request.url.path == "/api/v1/tts_async/submit":
-        body = exc.body if isinstance(exc.body, dict) else {}
         error = AsyncTTSErrorResponse(
-            reqid=str(body.get("reqid", "")),
             code=40000,
             message="Request parameter error.",
         )
@@ -84,9 +82,8 @@ async def submit_async_tts(
 ) -> AsyncTTSSubmitResponse | AsyncTTSErrorResponse:
     sentence_gap_ms = request.sentence_interval if request.sentence_interval is not None else None
     internal_request = CreateChapterJobRequest(
-        reqid=request.reqid,
         sentences=request.sentences,
-        reference_id=request.reference_id or settings.fish_reference_id,
+        reference_id=request.reference_id,
         sentence_gap_ms=sentence_gap_ms,
         text_length=request.text_length(),
     )
@@ -94,7 +91,6 @@ async def submit_async_tts(
         job = await jobs.create_job(internal_request)
     except ValueError as exc:
         return AsyncTTSErrorResponse(
-            reqid=request.reqid,
             code=40000,
             message=str(exc),
         )
@@ -113,14 +109,13 @@ async def submit_async_tts(
 )
 async def query_async_tts(
     request: Request,
-    appid: str = Query(...),
+    appid: str | None = Query(default=None),
     task_id: str = Query(...),
 ) -> AsyncTTSQueryResponse | AsyncTTSErrorResponse:
     del appid
     job = await jobs.get_job(task_id)
     if job is None:
         return AsyncTTSErrorResponse(
-            reqid=task_id,
             code=40400,
             message="Task does not exist or has expired.",
         )

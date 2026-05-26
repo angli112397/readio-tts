@@ -6,7 +6,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class CreateChapterJobRequest(BaseModel):
-    reqid: str | None = None
     sentences: list[str] = Field(min_length=1)
     reference_id: str | None = None
     sentence_gap_ms: int | None = Field(default=None, ge=0, le=5_000)
@@ -19,19 +18,11 @@ class CreateChapterJobRequest(BaseModel):
             raise ValueError("Sentences cannot be blank.")
         return sentences
 
-    @field_validator("text_length")
-    @classmethod
-    def require_positive_text_length(cls, text_length: int | None) -> int | None:
-        if text_length is not None and text_length < 1:
-            raise ValueError("Text length must be positive.")
-        return text_length
-
-
 class AsyncTTSSubmitRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    appid: str = Field(min_length=1)
-    reqid: str = Field(min_length=20, max_length=64)
+    appid: str | None = None
+    reqid: str | None = None
     format: Literal["wav"] = "wav"
     enable_subtitle: Literal[1] = 1
     sentence_interval: int | None = Field(default=None, ge=0, le=3_000)
@@ -45,13 +36,6 @@ class AsyncTTSSubmitRequest(BaseModel):
             raise ValueError("Sentences cannot be blank.")
         return sentences
 
-    @field_validator("sentence_interval")
-    @classmethod
-    def require_valid_sentence_interval(cls, sentence_interval: int | None) -> int | None:
-        if sentence_interval is not None and sentence_interval < 0:
-            raise ValueError("Sentence interval must be non-negative.")
-        return sentence_interval
-
     def text_length(self) -> int:
         return sum(len(sentence) for sentence in self.sentences)
 
@@ -63,7 +47,6 @@ class AsyncTTSSubmitResponse(BaseModel):
 
 
 class AsyncTTSErrorResponse(BaseModel):
-    reqid: str
     code: int
     message: str
 
@@ -102,7 +85,6 @@ class ChapterResult(BaseModel):
 
 class ChapterJobResponse(BaseModel):
     job_id: str
-    reqid: str | None = None
     status: JobStatus
     created_at: datetime
     processed_sentences: int = 0
