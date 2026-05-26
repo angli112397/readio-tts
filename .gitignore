@@ -14,14 +14,11 @@ htmlcov/
 *.egg-info/
 data/jobs/
 data/samples/
-data/csemotions-extracted/
-CSEMOTIONS/
 GPT-SoVITS/
 gpt-pretrained_models/
 checkpoints/
 *.pth
 *.ckpt
 *.safetensors
-*.parquet
 references/*
 !references/.gitkeep

@@ -12,17 +12,15 @@ services:
     volumes:
       - ./references/gpt:/workspace/GPT-SoVITS/references
       - ./GPT-SoVITS:/workspace/GPT-SoVITS/GPT_SoVITS/pretrained_models
+      - ./deployment/gpt_sovits/tts_infer.yaml:/run/readio/tts_infer.yaml:ro
     ports:
       - "${READIO_GPT_BIND:-127.0.0.1}:9880:9880"
     command:
-      - python
-      - api_v2.py
-      - -a
-      - 0.0.0.0
-      - -p
-      - "9880"
-      - -c
-      - GPT_SoVITS/configs/tts_infer.yaml
+      - bash
+      - -lc
+      - >-
+        cp /run/readio/tts_infer.yaml /tmp/readio_tts_infer.yaml
+        && exec python api_v2.py -a 0.0.0.0 -p 9880 -c /tmp/readio_tts_infer.yaml
     deploy:
       resources:
         reservations:

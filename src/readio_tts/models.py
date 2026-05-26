@@ -1,94 +1,117 @@
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-class CreateChapterJobRequest(BaseModel):
-    sentences: list[str] = Field(min_length=1)
-    reference_id: str | None = None
-    sentence_gap_ms: int | None = Field(default=None, ge=0, le=5_000)
-    text_length: int | None = Field(default=None, ge=1)
-
-    @field_validator("sentences")
-    @classmethod
-    def require_non_empty_sentences(cls, sentences: list[str]) -> list[str]:
-        if any(not sentence.strip() for sentence in sentences):
-            raise ValueError("Sentences cannot be blank.")
-        return sentences
-
-class AsyncTTSSubmitRequest(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    appid: str | None = None
-    reqid: str | None = None
-    format: Literal["wav"] = "wav"
-    enable_subtitle: Literal[1] = 1
-    sentence_interval: int | None = Field(default=None, ge=0, le=3_000)
-    reference_id: str | None = None
-    sentences: list[str] = Field(min_length=1)
-
-    @field_validator("sentences")
-    @classmethod
-    def require_non_empty_sentences(cls, sentences: list[str]) -> list[str]:
-        if any(not sentence.strip() for sentence in sentences):
-            raise ValueError("Sentences cannot be blank.")
-        return sentences
-
-    def text_length(self) -> int:
-        return sum(len(sentence) for sentence in self.sentences)
-
-
-class AsyncTTSSubmitResponse(BaseModel):
-    task_id: str
-    task_status: int
-    text_length: int
-
-
-class AsyncTTSErrorResponse(BaseModel):
-    code: int
-    message: str
-
-
-class AsyncTTSSentence(BaseModel):
-    text: str
-    origin_text: str
-    paragraph_no: int
-    begin_time: int
-    end_time: int
-
-
-class AsyncTTSQueryResponse(BaseModel):
-    task_id: str
-    task_status: int
-    text_length: int
-    code: int | None = None
-    message: str | None = None
-    audio_url: str | None = None
-    url_expire_time: int | None = None
-    sentences: list[AsyncTTSSentence] | None = None
-
-
-class JobStatus(StrEnum):
-    QUEUED = "queued"
-    PROCESSING = "processing"
-    COMPLETE = "complete"
-    FAILED = "failed"
-
-
-class ChapterResult(BaseModel):
+class SentenceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    sentences: list[AsyncTTSSentence] = Field(default_factory=list)
+    id: str = Field(min_length=1)
+    text: str = Field(min_length=1)
+    paragraph_index: int = Field(default=0, ge=0)
+
+    @field_validator("text")
+    @classmethod
+    def require_spoken_text(cls, text: str) -> str:
+        if not text.strip():
+            raise ValueError("Sentence text cannot be blank.")
+        return text
 
 
-class ChapterJobResponse(BaseModel):
+class CreateJobRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    chapter_id: str = Field(min_length=1)
+    voice_id: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",
+    )
+    sentence_gap_ms: int = Field(default=600, ge=0, le=5_000)
+    sentences: list[SentenceRequest] = Field(min_length=1)
+
+    @field_validator("sentences")
+    @classmethod
+    def require_unique_sentence_ids(
+        cls,
+        sentences: list[SentenceRequest],
+    ) -> list[SentenceRequest]:
+        sentence_ids = [sentence.id for sentence in sentences]
+        if len(sentence_ids) != len(set(sentence_ids)):
+            raise ValueError("Sentence IDs must be unique within a chapter.")
+        return sentences
+
+
+class JobState(StrEnum):
+    QUEUED = "queued"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class ManifestSentence(BaseModel):
+    id: str
+    paragraph_index: int
+    begin_ms: int
+    end_ms: int
+
+
+class ChapterManifest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    chapter_id: str
+    voice_id: str
+    duration_ms: int
+    sentence_gap_ms: int
+    sentences: list[ManifestSentence]
+
+
+class PersistedJobState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     job_id: str
-    status: JobStatus
+    idempotency_key: str
+    synthesis_signature: str | None = None
+    state: JobState
     created_at: datetime
-    processed_sentences: int = 0
-    sentence_count: int
-    text_length: int = 0
-    result: ChapterResult | None = None
+    updated_at: datetime
+    sentences_completed: int = 0
+    audio_size_bytes: int | None = None
+    audio_sha256: str | None = None
+    error: str | None = None
+
+
+class JobRecord(PersistedJobState):
+    request: CreateJobRequest
+
+
+class CreateJobResponse(BaseModel):
+    job_id: str
+    state: JobState
+    status_url: str
+
+
+class JobProgress(BaseModel):
+    sentences_completed: int
+    sentences_total: int
+
+
+class JobArtifact(BaseModel):
+    audio_url: str
+    manifest_url: str
+    mime_type: str = "audio/wav"
+    size_bytes: int
+    sha256: str
+
+
+class JobResponse(BaseModel):
+    job_id: str
+    chapter_id: str
+    state: JobState
+    progress: JobProgress
+    created_at: datetime
+    updated_at: datetime
+    artifact: JobArtifact | None = None
     error: str | None = None

@@ -59,14 +59,13 @@ def test_gpt_sovits_request_uses_reference_profile_files(tmp_path: Path) -> None
                 Settings(
                     provider="gpt",
                     gpt_reference_dir=tmp_path / "references",
-                    gpt_default_reference_id="mandarin_reader",
                     gpt_text_lang="zh",
                     gpt_prompt_lang="zh",
                     gpt_text_split_method="cut0",
                 ),
                 client=client,
             )
-            audio = await provider.synthesize("第一句。")
+            audio = await provider.synthesize("第一句。", "mandarin_reader")
             assert audio == b"wav"
 
     asyncio.run(exercise())
@@ -90,3 +89,32 @@ def test_gpt_sovits_request_uses_reference_profile_files(tmp_path: Path) -> None
             "streaming_mode": False,
         }
     ]
+
+
+def test_gpt_signature_changes_with_model_or_reference_audio(tmp_path: Path) -> None:
+    reference_dir = tmp_path / "references" / "mandarin_reader"
+    reference_dir.mkdir(parents=True)
+    audio_path = reference_dir / "sample.wav"
+    audio_path.write_bytes(b"voice-a")
+    (reference_dir / "sample.lab").write_text("prompt", encoding="utf-8")
+
+    async def signature(model_revision: str) -> str:
+        provider = GptSoVitsProvider(
+            Settings(
+                provider="gpt",
+                gpt_model_revision=model_revision,
+                gpt_reference_dir=tmp_path / "references",
+            )
+        )
+        try:
+            return await provider.synthesis_signature("mandarin_reader")
+        finally:
+            await provider.close()
+
+    v2 = asyncio.run(signature("v2"))
+    proplus = asyncio.run(signature("v2ProPlus"))
+    audio_path.write_bytes(b"voice-b")
+    changed_reference = asyncio.run(signature("v2ProPlus"))
+
+    assert v2 != proplus
+    assert proplus != changed_reference

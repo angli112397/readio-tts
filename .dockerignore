@@ -6,8 +6,6 @@ __pycache__
 .pytest_cache
 .pytest-tmp
 data
-deployment
-fish-speech
 references
 tests
 GPT-SoVITS

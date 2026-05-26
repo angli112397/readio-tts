@@ -15,15 +15,13 @@ class Settings(BaseSettings):
     provider: Literal["mock", "gpt"] = "gpt"
     storage_dir: Path = Path("data/jobs")
     max_chapter_characters: int = 200_000
-    sentence_gap_ms: int = Field(default=600, ge=0, le=5_000)
     job_retention_days: int = Field(default=7, ge=1, le=365)
-    audio_url_signing_key: str = Field(default="replace-for-non-local-use", min_length=16)
 
     gpt_base_url: str = "http://127.0.0.1:9880"
     gpt_api_key: str | None = None
+    gpt_model_revision: str = "v2ProPlus"
     gpt_timeout_seconds: float = 300.0
     gpt_reference_dir: Path = Path("references/gpt")
-    gpt_default_reference_id: str | None = None
     gpt_text_lang: str = "zh"
     gpt_prompt_lang: str = "zh"
     gpt_text_split_method: str = "cut0"
