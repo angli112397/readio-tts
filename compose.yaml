@@ -8,16 +8,15 @@ x-service-common: &service-common
   init: true
   environment: &gateway-environment
     READIO_PROVIDER: ${READIO_PROVIDER:-gpt}
-    READIO_DATA_DIR: /app/data
+    READIO_DATA_DIR: /var/lib/readio
+    READIO_API_TOKEN: ${READIO_API_TOKEN:?Set READIO_API_TOKEN to the Android bearer token}
     READIO_MAX_CHAPTER_CHARACTERS: ${READIO_MAX_CHAPTER_CHARACTERS:-500000}
     READIO_JOB_RETENTION_DAYS: ${READIO_JOB_RETENTION_DAYS:-7}
-    READIO_GPT_BASE_URL: ${READIO_GPT_BASE_URL:-http://gpt-sovits:9880}
+    READIO_WORKER_STALE_SECONDS: ${READIO_WORKER_STALE_SECONDS:-30}
+    READIO_GPT_BASE_URL: http://gpt-sovits:9880
     READIO_GPT_MODEL_REVISION: ${READIO_GPT_MODEL_REVISION:-v2ProPlus}
     READIO_GPT_TIMEOUT_SECONDS: ${READIO_GPT_TIMEOUT_SECONDS:-300}
-    READIO_GPT_REFERENCE_DIR: /app/references/gpt
-    READIO_GPT_JOB_DATA_REMOTE_DIR: job-data/jobs
-    READIO_GPT_TEXT_LANG: ${READIO_GPT_TEXT_LANG:-zh}
-    READIO_GPT_PROMPT_LANG: ${READIO_GPT_PROMPT_LANG:-zh}
+    READIO_GPT_JOB_DATA_REMOTE_DIR: /var/lib/readio/jobs
     READIO_GPT_TEXT_SPLIT_METHOD: ${READIO_GPT_TEXT_SPLIT_METHOD:-cut0}
     READIO_GPT_BATCH_SIZE: ${READIO_GPT_BATCH_SIZE:-1}
     READIO_GPT_TOP_K: ${READIO_GPT_TOP_K:-15}
@@ -27,7 +26,7 @@ x-service-common: &service-common
     READIO_GPT_FRAGMENT_INTERVAL: ${READIO_GPT_FRAGMENT_INTERVAL:-0.3}
     READIO_GPT_SEED: ${READIO_GPT_SEED:--1}
   volumes:
-    - ${READIO_DATA_DIR:?Set READIO_DATA_DIR to a local non-synchronized folder}:/app/data
+    - ${READIO_DATA_DIR:?Set READIO_DATA_DIR to a local non-synchronized folder}:/var/lib/readio
   read_only: true
   tmpfs:
     - /tmp
@@ -39,9 +38,6 @@ x-service-common: &service-common
 services:
   gateway:
     <<: *service-common
-    volumes:
-      - ${READIO_DATA_DIR:?Set READIO_DATA_DIR to a local non-synchronized folder}:/app/data
-      - ./references/gpt:/app/references/gpt:ro
     command: ["uvicorn", "readio_tts.api:app", "--host", "0.0.0.0", "--port", "8090", "--workers", "1"]
     ports:
       - "${READIO_GATEWAY_BIND:-0.0.0.0}:${READIO_GATEWAY_PORT:-8090}:8090"

@@ -1,18 +1,24 @@
 import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
+from threading import Barrier
 
+import pytest
 import readio_tts.jobs as jobs_module
-from readio_tts.jobs import JobManager, JobWorker
-from readio_tts.models import CreateJobRequest, JobState, SentenceRequest
+from readio_tts.jobs import IdempotencyConflictError, JobManager, JobWorker
+from readio_tts.models import CreateJobRequest, JobState, SentenceRequest, VoiceRecord
 from readio_tts.providers import MockSpeechProvider, SynthesisError
-from readio_tts.repository import JobRepository
+from readio_tts.repository import JobRepository, VoiceRepository
+from readio_tts.voices import VoiceManager, VoiceUnavailableError
 
 
 def make_request() -> CreateJobRequest:
     return CreateJobRequest(
         chapter_id="chapter-1",
         voice_id="reader",
+        text_language="en",
         sentence_gap_ms=400,
         sentences=[
             SentenceRequest(id="s1", text="Hello."),
@@ -22,17 +28,33 @@ def make_request() -> CreateJobRequest:
 
 
 def make_manager(tmp_path: Path) -> JobManager:
-    reference = tmp_path / "references" / "reader"
-    reference.mkdir(parents=True, exist_ok=True)
-    (reference / "voice.wav").write_bytes(b"reference-audio")
-    (reference / "voice.lab").write_text("prompt", encoding="utf-8")
+    database = tmp_path / "readio.sqlite3"
+    voices = VoiceManager(VoiceRepository(database), tmp_path / "voices")
+    install_voice(voices)
     return JobManager(
-        JobRepository(tmp_path / "readio.sqlite3"),
+        JobRepository(database),
         tmp_path / "jobs",
-        tmp_path / "references",
+        voices,
         "v2ProPlus",
         1_000,
     )
+
+
+def install_voice(voices: VoiceManager) -> None:
+    voices.repository.create(
+        VoiceRecord(
+            voice_id="reader",
+            display_name="Reader",
+            reference_language="en",
+            transcript="prompt",
+            duration_ms=500,
+            audio_size_bytes=15,
+            audio_sha256="a" * 64,
+            created_at=datetime.now(UTC),
+        )
+    )
+    (voices.voices_dir / "reader").mkdir()
+    (voices.voices_dir / "reader" / "reference.wav").write_bytes(b"reference-audio")
 
 
 def test_worker_publishes_audio_manifest_and_sqlite_progress(tmp_path: Path) -> None:
@@ -45,6 +67,7 @@ def test_worker_publishes_audio_manifest_and_sqlite_progress(tmp_path: Path) -> 
         completed = manager.get_job(job.job_id)
 
         assert completed is not None
+        assert manager.repository.worker_last_seen_at() is not None
         assert completed.state == JobState.SUCCEEDED
         assert completed.completed_sentences == 2
         assert completed.audio_size_bytes
@@ -58,14 +81,13 @@ def test_worker_publishes_audio_manifest_and_sqlite_progress(tmp_path: Path) -> 
 
 
 def test_create_snapshots_selected_reference_for_a_job(tmp_path: Path) -> None:
-    reference = tmp_path / "references" / "reader"
-    reference.mkdir(parents=True)
-    (reference / "voice.wav").write_bytes(b"reference-audio")
-    (reference / "voice.lab").write_text("prompt", encoding="utf-8")
+    database = tmp_path / "readio.sqlite3"
+    voices = VoiceManager(VoiceRepository(database), tmp_path / "voices")
+    install_voice(voices)
     manager = JobManager(
-        JobRepository(tmp_path / "readio.sqlite3"),
+        JobRepository(database),
         tmp_path / "jobs",
-        tmp_path / "references",
+        voices,
         "v2ProPlus",
         1_000,
     )
@@ -73,48 +95,137 @@ def test_create_snapshots_selected_reference_for_a_job(tmp_path: Path) -> None:
     job, _ = manager.create_job(make_request(), "snapshot")
 
     assert (manager.files(job.job_id).input / "reference.wav").read_bytes() == b"reference-audio"
-    assert (manager.files(job.job_id).input / "reference.lab").read_text(encoding="utf-8") == "prompt"
+    assert (
+        json.loads((manager.files(job.job_id).input / "voice.json").read_text(encoding="utf-8"))
+        == {"reference_language": "en", "transcript": "prompt"}
+    )
 
 
 def test_missing_reference_does_not_leave_an_orphan_job_directory(tmp_path: Path) -> None:
+    database = tmp_path / "readio.sqlite3"
     manager = JobManager(
-        JobRepository(tmp_path / "readio.sqlite3"),
+        JobRepository(database),
         tmp_path / "jobs",
-        tmp_path / "references",
+        VoiceManager(VoiceRepository(database), tmp_path / "voices"),
         "v2ProPlus",
         1_000,
     )
 
-    try:
+    with pytest.raises(VoiceUnavailableError):
         manager.create_job(make_request(), "missing-reference")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("Expected missing voice reference to be rejected.")
+
+    assert list((tmp_path / "jobs").iterdir()) == []
+
+
+def test_voice_with_missing_audio_does_not_leave_an_orphan_job_directory(tmp_path: Path) -> None:
+    database = tmp_path / "readio.sqlite3"
+    voices = VoiceManager(VoiceRepository(database), tmp_path / "voices")
+    voices.repository.create(
+        VoiceRecord(
+            voice_id="reader",
+            display_name="Reader",
+            reference_language="en",
+            transcript="prompt",
+            duration_ms=500,
+            audio_size_bytes=15,
+            audio_sha256="a" * 64,
+            created_at=datetime.now(UTC),
+        )
+    )
+    manager = JobManager(
+        JobRepository(database),
+        tmp_path / "jobs",
+        voices,
+        "v2ProPlus",
+        1_000,
+    )
+
+    with pytest.raises(VoiceUnavailableError, match="audio is missing"):
+        manager.create_job(make_request(), "missing-audio")
 
     assert list((tmp_path / "jobs").iterdir()) == []
 
 
 def test_rejects_oversized_chapter(tmp_path: Path) -> None:
+    database = tmp_path / "readio.sqlite3"
     manager = JobManager(
-        JobRepository(tmp_path / "readio.sqlite3"),
+        JobRepository(database),
         tmp_path / "jobs",
-        tmp_path / "references",
+        VoiceManager(VoiceRepository(database), tmp_path / "voices"),
         "v2ProPlus",
         3,
     )
     request = CreateJobRequest(
         chapter_id="large",
         voice_id="reader",
+        text_language="en",
         sentences=[SentenceRequest(id="s1", text="abcd")],
     )
 
-    try:
+    with pytest.raises(ValueError, match="maximum is 3"):
         manager.create_job(request, "too-large")
-    except ValueError as exc:
-        assert "maximum is 3" in str(exc)
-    else:
-        raise AssertionError("Expected oversized request to be rejected.")
+
+
+def test_concurrent_idempotent_submissions_share_one_job(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    manager = make_manager(tmp_path)
+    request = make_request()
+    barrier = Barrier(2)
+    snapshot_to = manager.voice_manager.snapshot_to
+
+    def synchronized_snapshot(*args, **kwargs) -> None:
+        snapshot_to(*args, **kwargs)
+        barrier.wait(timeout=5)
+
+    monkeypatch.setattr(manager.voice_manager, "snapshot_to", synchronized_snapshot)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(manager.create_job, request, "same-idempotency-key")
+            for _ in range(2)
+        ]
+        results = [future.result(timeout=5) for future in futures]
+
+    assert len({record.job_id for record, _created in results}) == 1
+    assert sorted(created for _record, created in results) == [False, True]
+    assert len(list(manager.jobs_dir.iterdir())) == 1
+
+
+def test_concurrent_conflicting_idempotency_submissions_reject_one(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    manager = make_manager(tmp_path)
+    first_request = make_request()
+    second_request = first_request.model_copy(update={"chapter_id": "different-chapter"})
+    barrier = Barrier(2)
+    snapshot_to = manager.voice_manager.snapshot_to
+
+    def synchronized_snapshot(*args, **kwargs) -> None:
+        snapshot_to(*args, **kwargs)
+        barrier.wait(timeout=5)
+
+    monkeypatch.setattr(manager.voice_manager, "snapshot_to", synchronized_snapshot)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(manager.create_job, request, "conflicting-key")
+            for request in (first_request, second_request)
+        ]
+
+        successes = []
+        failures = []
+        for future in futures:
+            try:
+                successes.append(future.result(timeout=5))
+            except IdempotencyConflictError as exc:
+                failures.append(exc)
+
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert len(list(manager.jobs_dir.iterdir())) == 1
 
 
 def test_worker_restart_reuses_existing_sentence_checkpoint(tmp_path: Path) -> None:
@@ -122,9 +233,9 @@ def test_worker_restart_reuses_existing_sentence_checkpoint(tmp_path: Path) -> N
         def __init__(self) -> None:
             self.texts: list[str] = []
 
-        async def synthesize(self, text: str, job_id: str) -> bytes:
+        async def synthesize(self, text: str, job_id: str, text_language: str) -> bytes:
             self.texts.append(text)
-            return await super().synthesize(text, job_id)
+            return await super().synthesize(text, job_id, text_language)
 
     async def exercise() -> None:
         manager = make_manager(tmp_path)
@@ -132,7 +243,7 @@ def test_worker_restart_reuses_existing_sentence_checkpoint(tmp_path: Path) -> N
         provider = CountingProvider()
         files = manager.files(job.job_id)
         (files.segments / "000000.wav").write_bytes(
-            await provider.synthesize("Hello.", job.job_id)
+            await provider.synthesize("Hello.", job.job_id, "en")
         )
         record = manager.get_job(job.job_id)
         assert record is not None
@@ -160,7 +271,7 @@ def test_sentence_failure_retries_once_then_marks_job_failed(
         def __init__(self) -> None:
             self.calls = 0
 
-        async def synthesize(self, text: str, job_id: str) -> bytes:
+        async def synthesize(self, text: str, job_id: str, text_language: str) -> bytes:
             self.calls += 1
             raise SynthesisError(
                 "tts_unavailable",
@@ -195,7 +306,7 @@ def test_non_retryable_sentence_failure_is_recorded_without_retry(tmp_path: Path
         def __init__(self) -> None:
             self.calls = 0
 
-        async def synthesize(self, text: str, job_id: str) -> bytes:
+        async def synthesize(self, text: str, job_id: str, text_language: str) -> bytes:
             self.calls += 1
             raise SynthesisError(
                 "tts_request_rejected",

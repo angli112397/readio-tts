@@ -20,5 +20,3 @@ checkpoints/
 *.pth
 *.ckpt
 *.safetensors
-references/*
-!references/.gitkeep

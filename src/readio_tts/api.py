@@ -1,9 +1,13 @@
+from datetime import UTC, datetime, timedelta
+import hmac
 import logging
+from pathlib import Path
 from typing import Annotated
 
-from fastapi import FastAPI, Header, Request, Response, status
+from fastapi import APIRouter, FastAPI, File, Form, Header, Request, Response, Security, UploadFile, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .config import Settings
 from .jobs import ChapterTooLargeError, IdempotencyConflictError, JobManager
@@ -12,32 +16,57 @@ from .models import (
     CreateJobResponse,
     ErrorInfo,
     ErrorResponse,
+    LanguageCode,
     JobArtifact,
     JobProgress,
     JobRecord,
     JobResponse,
     JobState,
+    VoiceRecord,
 )
-from .repository import JobRepository
+from .repository import JobRepository, VoiceRepository
+from .voices import InvalidVoiceAudioError, VoiceManager, VoiceUnavailableError
 
 
 logger = logging.getLogger(__name__)
 settings = Settings()
+database_path = settings.data_dir / "readio.sqlite3"
+voice_manager = VoiceManager(
+    VoiceRepository(database_path),
+    settings.data_dir / "voices",
+)
 manager = JobManager(
-    repository=JobRepository(settings.data_dir / "readio.sqlite3"),
+    repository=JobRepository(database_path),
     jobs_dir=settings.data_dir / "jobs",
-    reference_dir=settings.gpt_reference_dir,
+    voice_manager=voice_manager,
     model_revision=settings.gpt_model_revision,
     max_chapter_characters=settings.max_chapter_characters,
     job_retention_days=settings.job_retention_days,
 )
-app = FastAPI(title="Readio TTS", version="0.3.0")
+app = FastAPI(title="Readio TTS", version="0.4.0")
 
 
 class ApiError(Exception):
     def __init__(self, status_code: int, code: str, message: str) -> None:
         self.status_code = status_code
         self.error = ErrorInfo(code=code, message=message)
+
+
+bearer = HTTPBearer(auto_error=False)
+
+
+def require_api_token(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Security(bearer)],
+) -> None:
+    if (
+        credentials is None
+        or credentials.scheme.lower() != "bearer"
+        or not hmac.compare_digest(credentials.credentials, settings.api_token)
+    ):
+        raise ApiError(401, "unauthorized", "Invalid API token.")
+
+
+router = APIRouter(prefix="/v1", dependencies=[Security(require_api_token)])
 
 
 @app.exception_handler(ApiError)
@@ -84,7 +113,58 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/v1/jobs", response_model=CreateJobResponse, status_code=status.HTTP_202_ACCEPTED)
+@router.post("/voices", response_model=VoiceRecord, status_code=status.HTTP_201_CREATED)
+async def create_voice(
+    display_name: Annotated[str, Form(min_length=1, max_length=100)],
+    reference_language: Annotated[LanguageCode, Form()],
+    transcript: Annotated[str, Form(min_length=1)],
+    audio: Annotated[UploadFile, File()],
+) -> VoiceRecord:
+    if Path(audio.filename or "").suffix.lower() != ".wav":
+        raise ApiError(422, "invalid_voice_audio", "Reference audio must be a WAV file.")
+    try:
+        return voice_manager.create(
+            display_name=display_name,
+            reference_language=reference_language,
+            transcript=transcript,
+            audio=await audio.read(voice_manager.max_audio_bytes + 1),
+        )
+    except InvalidVoiceAudioError as exc:
+        raise ApiError(422, "invalid_voice_audio", str(exc)) from exc
+    except ValueError as exc:
+        raise ApiError(422, "invalid_request", str(exc)) from exc
+
+
+@router.get("/voices", response_model=list[VoiceRecord])
+async def list_voices() -> list[VoiceRecord]:
+    return voice_manager.list_all()
+
+
+@router.get("/voices/{voice_id}", response_model=VoiceRecord)
+async def get_voice(voice_id: str) -> VoiceRecord:
+    voice = voice_manager.get(voice_id)
+    if voice is None:
+        raise ApiError(404, "voice_not_found", "Voice not found.")
+    return voice
+
+
+@router.get("/voices/{voice_id}/audio", response_class=FileResponse)
+async def get_voice_audio(voice_id: str) -> FileResponse:
+    if voice_manager.get(voice_id) is None:
+        raise ApiError(404, "voice_not_found", "Voice not found.")
+    audio_path = voice_manager.audio_path(voice_id)
+    if audio_path is None:
+        raise ApiError(404, "voice_audio_not_found", "Voice audio not found.")
+    return FileResponse(audio_path, media_type="audio/wav", filename="reference.wav")
+
+
+@router.delete("/voices/{voice_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_voice(voice_id: str) -> Response:
+    voice_manager.delete(voice_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/jobs", response_model=CreateJobResponse, status_code=status.HTTP_202_ACCEPTED)
 async def create_job(
     request: CreateJobRequest,
     http_request: Request,
@@ -97,17 +177,27 @@ async def create_job(
         raise ApiError(413, "chapter_too_large", str(exc)) from exc
     except IdempotencyConflictError as exc:
         raise ApiError(409, "idempotency_conflict", str(exc)) from exc
-    except ValueError as exc:
-        raise ApiError(422, "invalid_voice_profile", str(exc)) from exc
+    except VoiceUnavailableError as exc:
+        raise ApiError(422, "voice_unavailable", str(exc)) from exc
     status_url = _absolute_url(http_request, f"/v1/jobs/{job.job_id}")
     response.headers["Location"] = status_url
     response.headers["Retry-After"] = "5"
     return CreateJobResponse(job_id=job.job_id, state=job.state, status_url=status_url)
 
 
-@app.get("/v1/jobs/{job_id}", response_model=JobResponse, response_model_exclude_none=True)
+@router.get("/jobs/{job_id}", response_model=JobResponse, response_model_exclude_none=True)
 async def get_job(job_id: str, request: Request) -> JobResponse:
     job = _require_job(job_id)
+    queue_position = manager.repository.queue_position(job)
+    blocked_by = None
+    if job.state in (JobState.QUEUED, JobState.RUNNING):
+        worker_last_seen = manager.repository.worker_last_seen_at()
+        worker_stale_after = timedelta(seconds=settings.worker_stale_seconds)
+        if (
+            worker_last_seen is None
+            or datetime.now(UTC) - worker_last_seen > worker_stale_after
+        ):
+            blocked_by = "worker_unavailable"
     artifact = None
     if job.state == JobState.SUCCEEDED:
         artifact = JobArtifact(
@@ -124,6 +214,8 @@ async def get_job(job_id: str, request: Request) -> JobResponse:
             sentences_completed=job.completed_sentences,
             sentences_total=job.total_sentences,
         ),
+        queue_position=queue_position,
+        blocked_by=blocked_by,
         created_at=job.created_at,
         updated_at=job.updated_at,
         heartbeat_at=job.heartbeat_at,
@@ -140,7 +232,7 @@ async def get_job(job_id: str, request: Request) -> JobResponse:
     )
 
 
-@app.get("/v1/jobs/{job_id}/audio", response_class=FileResponse)
+@router.get("/jobs/{job_id}/audio", response_class=FileResponse)
 async def get_audio(job_id: str) -> FileResponse:
     job = _require_succeeded_job(job_id)
     audio_path = manager.files(job.job_id).audio
@@ -149,7 +241,7 @@ async def get_audio(job_id: str) -> FileResponse:
     return FileResponse(audio_path, media_type="audio/wav", filename=f"{job_id}.wav")
 
 
-@app.get("/v1/jobs/{job_id}/manifest", response_class=FileResponse)
+@router.get("/jobs/{job_id}/manifest", response_class=FileResponse)
 async def get_manifest(job_id: str) -> FileResponse:
     job = _require_succeeded_job(job_id)
     manifest_path = manager.files(job.job_id).manifest
@@ -158,10 +250,13 @@ async def get_manifest(job_id: str) -> FileResponse:
     return FileResponse(manifest_path, media_type="application/json", filename="manifest.json")
 
 
-@app.delete("/v1/jobs/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/jobs/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_job(job_id: str) -> Response:
     manager.delete(job_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+app.include_router(router)
 
 
 def _require_job(job_id: str) -> JobRecord:

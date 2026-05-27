@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import logging
+import sqlite3
 import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12,10 +13,15 @@ from .models import (
     CreateJobRequest,
     JobRecord,
     JobState,
+    LanguageCode,
     ManifestSentence,
 )
-from .providers import SpeechProvider, SynthesisError, resolve_reference_profile
+from .providers import (
+    SpeechProvider,
+    SynthesisError,
+)
 from .repository import JobRepository
+from .voices import VoiceManager
 
 
 logger = logging.getLogger(__name__)
@@ -47,14 +53,14 @@ class JobManager:
         self,
         repository: JobRepository,
         jobs_dir: Path,
-        reference_dir: Path,
+        voice_manager: VoiceManager,
         model_revision: str,
         max_chapter_characters: int,
         job_retention_days: int = 7,
     ) -> None:
         self.repository = repository
         self.jobs_dir = jobs_dir
-        self.reference_dir = reference_dir
+        self.voice_manager = voice_manager
         self.model_revision = model_revision
         self.max_chapter_characters = max_chapter_characters
         self.retention = timedelta(days=job_retention_days)
@@ -99,8 +105,18 @@ class JobManager:
             files.input.mkdir(parents=True)
             files.segments.mkdir()
             files.request.write_text(request.model_dump_json(indent=2), encoding="utf-8")
-            self._snapshot_reference(request.voice_id, files.input)
+            self.voice_manager.snapshot_to(request.voice_id, files.input)
             self.repository.create(record)
+        except sqlite3.IntegrityError as exc:
+            shutil.rmtree(files.root, ignore_errors=True)
+            existing = self.repository.find_by_idempotency_key(idempotency_key)
+            if existing is None:
+                raise
+            if self.load_request(existing.job_id) != request:
+                raise IdempotencyConflictError(
+                    "Idempotency-Key was already used for a different job request."
+                ) from exc
+            return existing, False
         except Exception:
             shutil.rmtree(files.root, ignore_errors=True)
             raise
@@ -139,12 +155,6 @@ class JobManager:
         for job_id in self.repository.delete_expired_terminal_jobs(self.retention):
             shutil.rmtree(self.files(job_id).root, ignore_errors=True)
 
-    def _snapshot_reference(self, voice_id: str, destination: Path) -> None:
-        profile = resolve_reference_profile(self.reference_dir, voice_id)
-        audio_path = destination / f"reference{profile.audio_path.suffix.lower()}"
-        shutil.copyfile(profile.audio_path, audio_path)
-        (destination / "reference.lab").write_text(profile.prompt_text, encoding="utf-8")
-
 
 class JobWorker:
     def __init__(
@@ -153,25 +163,36 @@ class JobWorker:
         provider: SpeechProvider,
         *,
         poll_seconds: float = 1.0,
+        heartbeat_seconds: float = 10.0,
     ) -> None:
         self.manager = manager
         self.provider = provider
         self.poll_seconds = poll_seconds
+        self.heartbeat_seconds = heartbeat_seconds
 
     async def run_forever(self) -> None:
+        heartbeat = asyncio.create_task(self._heartbeat_loop())
         try:
             while True:
                 if not await self.run_once():
                     await asyncio.sleep(self.poll_seconds)
         finally:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
             await self.provider.close()
 
     async def run_once(self) -> bool:
+        self.manager.repository.touch_worker()
         record = self.manager.repository.next_pending()
         if record is None:
             return False
         await self.process(record)
         return True
+
+    async def _heartbeat_loop(self) -> None:
+        while True:
+            self.manager.repository.touch_worker()
+            await asyncio.sleep(self.heartbeat_seconds)
 
     async def process(self, record: JobRecord) -> None:
         files = self.manager.files(record.job_id)
@@ -197,7 +218,11 @@ class JobWorker:
                     return
                 sentence = request.sentences[index]
                 active_sentence_id = sentence.id
-                audio = await self._synthesize_with_retry(sentence.text, record.job_id)
+                audio = await self._synthesize_with_retry(
+                    sentence.text,
+                    record.job_id,
+                    request.text_language,
+                )
                 if self._cancelled(record.job_id):
                     self.manager.purge(record.job_id)
                     return
@@ -242,14 +267,19 @@ class JobWorker:
             record.error_sentence_id = active_sentence_id if not publishing else None
             self._touch(record)
 
-    async def _synthesize_with_retry(self, text: str, job_id: str) -> bytes:
+    async def _synthesize_with_retry(
+        self,
+        text: str,
+        job_id: str,
+        text_language: LanguageCode,
+    ) -> bytes:
         try:
-            return await self.provider.synthesize(text, job_id)
+            return await self.provider.synthesize(text, job_id, text_language)
         except SynthesisError as exc:
             if not exc.retryable:
                 raise
             await asyncio.sleep(2)
-            return await self.provider.synthesize(text, job_id)
+            return await self.provider.synthesize(text, job_id, text_language)
 
     def _cancelled(self, job_id: str) -> bool:
         return self.manager.repository.get(job_id) is None
@@ -278,6 +308,7 @@ def _publish_artifacts(
     manifest = ChapterManifest(
         chapter_id=request.chapter_id,
         voice_id=request.voice_id,
+        text_language=request.text_language,
         duration_ms=assembly.duration_ms,
         sentence_gap_ms=request.sentence_gap_ms,
         sentences=[

@@ -11,6 +11,7 @@ import wave
 import httpx
 
 from .config import Settings
+from .models import LanguageCode, VoiceSnapshot
 
 
 logger = logging.getLogger(__name__)
@@ -25,7 +26,7 @@ class SynthesisError(RuntimeError):
 
 
 class SpeechProvider(Protocol):
-    async def synthesize(self, text: str, job_id: str) -> bytes:
+    async def synthesize(self, text: str, job_id: str, text_language: LanguageCode) -> bytes:
         """Return one uncompressed PCM WAV utterance."""
 
     async def close(self) -> None:
@@ -33,51 +34,10 @@ class SpeechProvider(Protocol):
 
 
 @dataclass(frozen=True)
-class ReferenceProfile:
+class JobVoiceInput:
     audio_path: Path
     prompt_text: str
-
-
-def resolve_reference_profile(reference_dir: Path, voice_id: str) -> ReferenceProfile:
-    if Path(voice_id).name != voice_id or voice_id in {".", ".."}:
-        raise ValueError("Voice profile ID must be a single directory name.")
-    profile_dir = reference_dir / voice_id
-    if not profile_dir.is_dir():
-        raise ValueError(f"Voice profile '{voice_id}' does not exist.")
-
-    audio_path = _find_reference_audio(profile_dir)
-    prompt_text = _find_reference_text(audio_path)
-    if not prompt_text.strip():
-        raise ValueError(f"Voice profile '{voice_id}' is missing prompt text.")
-
-    return ReferenceProfile(audio_path=audio_path, prompt_text=prompt_text)
-
-
-def _find_reference_audio(profile_dir: Path) -> Path:
-    audio_suffixes = {".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac"}
-    for candidate in sorted(profile_dir.iterdir()):
-        if candidate.is_file() and candidate.suffix.lower() in audio_suffixes:
-            text_candidate = candidate.with_suffix(".lab")
-            if not text_candidate.exists():
-                text_candidate = candidate.with_suffix(".txt")
-            if text_candidate.exists():
-                return candidate
-    raise ValueError(
-        f"Voice profile '{profile_dir.name}' must contain an audio file "
-        "with a matching .lab or .txt transcript."
-    )
-
-
-def _find_reference_text(audio_path: Path) -> str:
-    lab_path = audio_path.with_suffix(".lab")
-    if lab_path.exists():
-        return lab_path.read_text(encoding="utf-8").strip()
-
-    txt_path = audio_path.with_suffix(".txt")
-    if txt_path.exists():
-        return txt_path.read_text(encoding="utf-8").strip()
-
-    raise ValueError(f"Reference audio '{audio_path.name}' is missing transcript text.")
+    language: LanguageCode
 
 
 class GptSoVitsProvider:
@@ -87,8 +47,6 @@ class GptSoVitsProvider:
         self._jobs_dir = settings.data_dir / "jobs"
         self._remote_jobs_dir = PurePosixPath(settings.gpt_job_data_remote_dir)
         self._options: dict[str, object] = {
-            "text_lang": settings.gpt_text_lang,
-            "prompt_lang": settings.gpt_prompt_lang,
             "text_split_method": settings.gpt_text_split_method,
             "batch_size": settings.gpt_batch_size,
             "top_k": settings.gpt_top_k,
@@ -101,8 +59,6 @@ class GptSoVitsProvider:
             "streaming_mode": False,
         }
         headers = {"Accept": "audio/wav"}
-        if settings.gpt_api_key:
-            headers["Authorization"] = f"Bearer {settings.gpt_api_key}"
         self._client = client or httpx.AsyncClient(
             base_url=settings.gpt_base_url.rstrip("/"),
             timeout=settings.gpt_timeout_seconds,
@@ -110,15 +66,17 @@ class GptSoVitsProvider:
         )
         self._owns_client = client is None
 
-    async def synthesize(self, text: str, job_id: str) -> bytes:
-        profile = self._resolve_job_profile(job_id)
+    async def synthesize(self, text: str, job_id: str, text_language: LanguageCode) -> bytes:
+        voice = self._resolve_job_voice(job_id)
         remote_audio_path = str(
-            self._remote_jobs_dir / job_id / "input" / profile.audio_path.name
+            self._remote_jobs_dir / job_id / "input" / voice.audio_path.name
         )
         payload = {
             "text": text,
+            "text_lang": text_language,
             "ref_audio_path": remote_audio_path,
-            "prompt_text": profile.prompt_text,
+            "prompt_text": voice.prompt_text,
+            "prompt_lang": voice.language,
             **self._options,
         }
 
@@ -163,31 +121,38 @@ class GptSoVitsProvider:
         if self._owns_client:
             await self._client.aclose()
 
-    def _resolve_job_profile(self, job_id: str) -> ReferenceProfile:
+    def _resolve_job_voice(self, job_id: str) -> JobVoiceInput:
         input_dir = self._jobs_dir / job_id / "input"
         if not input_dir.is_dir():
             raise SynthesisError(
                 "reference_snapshot_missing",
                 "The job reference audio snapshot is missing.",
             )
-        audio = next(
-            (path for path in sorted(input_dir.iterdir()) if path.stem == "reference" and path.suffix != ".lab"),
-            None,
-        )
-        if audio is None:
+        audio = input_dir / "reference.wav"
+        if not audio.exists():
             raise SynthesisError(
                 "reference_snapshot_missing",
                 "The job reference audio snapshot is missing.",
             )
-        prompt_path = input_dir / "reference.lab"
-        if not prompt_path.exists():
+        metadata_path = input_dir / "voice.json"
+        if not metadata_path.exists():
             raise SynthesisError(
                 "reference_snapshot_missing",
-                "The job reference transcript snapshot is missing.",
+                "The job voice snapshot is missing.",
             )
-        return ReferenceProfile(
+        try:
+            metadata = VoiceSnapshot.model_validate_json(
+                metadata_path.read_text(encoding="utf-8")
+            )
+        except ValueError as exc:
+            raise SynthesisError(
+                "reference_snapshot_invalid",
+                "The job voice snapshot is invalid.",
+            ) from exc
+        return JobVoiceInput(
             audio_path=audio,
-            prompt_text=prompt_path.read_text(encoding="utf-8").strip(),
+            prompt_text=metadata.transcript,
+            language=metadata.reference_language,
         )
 
 
@@ -207,7 +172,7 @@ class MockSpeechProvider:
 
     frame_rate = 24_000
 
-    async def synthesize(self, text: str, job_id: str) -> bytes:
+    async def synthesize(self, text: str, job_id: str, text_language: LanguageCode) -> bytes:
         duration_ms = max(80, min(2_000, len(text) * 35))
         frame_count = round(self.frame_rate * duration_ms / 1000)
         frequency = 330

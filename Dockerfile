@@ -13,7 +13,6 @@ RUN pip install .
 
 RUN addgroup --system readio \
     && adduser --system --ingroup readio --home /app readio \
-    && mkdir -p /app/data/jobs \
     && chown -R readio:readio /app
 
 USER readio

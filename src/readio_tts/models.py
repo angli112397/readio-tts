@@ -1,7 +1,42 @@
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+LanguageCode = Literal["zh", "en", "ja", "ko", "yue"]
+
+
+class VoiceRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    voice_id: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",
+    )
+    display_name: str = Field(min_length=1, max_length=100)
+    reference_language: LanguageCode
+    transcript: str = Field(min_length=1)
+    duration_ms: int = Field(gt=0)
+    audio_size_bytes: int = Field(gt=0)
+    audio_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    created_at: datetime
+
+    @field_validator("transcript")
+    @classmethod
+    def require_spoken_transcript(cls, transcript: str) -> str:
+        if not transcript.strip():
+            raise ValueError("Reference transcript cannot be blank.")
+        return transcript
+
+
+class VoiceSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reference_language: LanguageCode
+    transcript: str = Field(min_length=1)
 
 
 class SentenceRequest(BaseModel):
@@ -28,6 +63,7 @@ class CreateJobRequest(BaseModel):
         max_length=64,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",
     )
+    text_language: LanguageCode
     sentence_gap_ms: int = Field(default=600, ge=0, le=5_000)
     sentences: list[SentenceRequest] = Field(min_length=1)
 
@@ -62,6 +98,7 @@ class ChapterManifest(BaseModel):
 
     chapter_id: str
     voice_id: str
+    text_language: LanguageCode
     duration_ms: int
     sentence_gap_ms: int
     sentences: list[ManifestSentence]
@@ -122,6 +159,8 @@ class JobResponse(BaseModel):
     chapter_id: str
     state: JobState
     progress: JobProgress
+    queue_position: int | None = None
+    blocked_by: Literal["worker_unavailable"] | None = None
     created_at: datetime
     updated_at: datetime
     heartbeat_at: datetime | None = None

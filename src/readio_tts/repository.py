@@ -2,7 +2,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from .models import JobRecord, JobState
+from .models import JobRecord, JobState, VoiceRecord
 
 
 class JobRepository:
@@ -47,12 +47,57 @@ class JobRepository:
                 """
                 SELECT * FROM jobs
                 WHERE state IN (?, ?)
-                ORDER BY created_at
+                ORDER BY CASE state WHEN ? THEN 0 ELSE 1 END, created_at, job_id
                 LIMIT 1
                 """,
-                (JobState.RUNNING.value, JobState.QUEUED.value),
+                (
+                    JobState.RUNNING.value,
+                    JobState.QUEUED.value,
+                    JobState.RUNNING.value,
+                ),
             ).fetchone()
         return self._record(row)
+
+    def queue_position(self, record: JobRecord) -> int | None:
+        if record.state != JobState.QUEUED:
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS position FROM jobs
+                WHERE state = ?
+                   OR (
+                        state = ?
+                        AND (created_at < ? OR (created_at = ? AND job_id <= ?))
+                   )
+                """,
+                (
+                    JobState.RUNNING.value,
+                    JobState.QUEUED.value,
+                    record.created_at.isoformat(),
+                    record.created_at.isoformat(),
+                    record.job_id,
+                ),
+            ).fetchone()
+        return int(row["position"]) if row is not None else None
+
+    def touch_worker(self, timestamp: datetime | None = None) -> None:
+        value = (timestamp or datetime.now(UTC)).isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO service_state (key, timestamp) VALUES ('worker', ?)
+                ON CONFLICT(key) DO UPDATE SET timestamp = excluded.timestamp
+                """,
+                (value,),
+            )
+
+    def worker_last_seen_at(self) -> datetime | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT timestamp FROM service_state WHERE key = 'worker'"
+            ).fetchone()
+        return datetime.fromisoformat(row["timestamp"]) if row is not None else None
 
     def save(self, record: JobRecord) -> None:
         with self._connect() as connection:
@@ -136,9 +181,15 @@ class JobRepository:
                 )
                 """
             )
-            self._add_column_if_missing(connection, "error_code", "TEXT")
-            self._add_column_if_missing(connection, "error_message", "TEXT")
-            self._add_column_if_missing(connection, "error_sentence_id", "TEXT")
+            _create_voices_table(connection)
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS service_state (
+                    key TEXT PRIMARY KEY,
+                    timestamp TEXT NOT NULL
+                )
+                """
+            )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._database_path, timeout=10)
@@ -194,19 +245,96 @@ class JobRepository:
             record.error_sentence_id,
         )
 
-    @staticmethod
-    def _add_column_if_missing(
-        connection: sqlite3.Connection,
-        column: str,
-        definition: str,
-    ) -> None:
-        columns = {
-            row["name"]
-            for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
-        }
-        if column not in columns:
-            connection.execute(f"ALTER TABLE jobs ADD COLUMN {column} {definition}")
+class VoiceRepository:
+    def __init__(self, database_path: Path) -> None:
+        self._database_path = database_path
+        self._database_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            _create_voices_table(connection)
+
+    def create(self, record: VoiceRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO voices (
+                    voice_id, display_name, reference_language, transcript,
+                    duration_ms, audio_size_bytes, audio_sha256, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                _voice_values(record),
+            )
+
+    def get(self, voice_id: str) -> VoiceRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM voices WHERE voice_id = ?",
+                (voice_id,),
+            ).fetchone()
+        return _voice_record(row)
+
+    def list_all(self) -> list[VoiceRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM voices ORDER BY created_at DESC, voice_id"
+            ).fetchall()
+        return [_voice_record(row) for row in rows if row is not None]
+
+    def delete(self, voice_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM voices WHERE voice_id = ?", (voice_id,))
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self._database_path, timeout=10)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=10000")
+        return connection
 
 
 def _timestamp(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
+
+
+def _create_voices_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS voices (
+            voice_id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            reference_language TEXT NOT NULL,
+            transcript TEXT NOT NULL,
+            duration_ms INTEGER NOT NULL CHECK (duration_ms > 0),
+            audio_size_bytes INTEGER NOT NULL CHECK (audio_size_bytes > 0),
+            audio_sha256 TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _voice_record(row: sqlite3.Row | None) -> VoiceRecord | None:
+    if row is None:
+        return None
+    return VoiceRecord(
+        voice_id=row["voice_id"],
+        display_name=row["display_name"],
+        reference_language=row["reference_language"],
+        transcript=row["transcript"],
+        duration_ms=row["duration_ms"],
+        audio_size_bytes=row["audio_size_bytes"],
+        audio_sha256=row["audio_sha256"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _voice_values(record: VoiceRecord) -> tuple[object, ...]:
+    return (
+        record.voice_id,
+        record.display_name,
+        record.reference_language,
+        record.transcript,
+        record.duration_ms,
+        record.audio_size_bytes,
+        record.audio_sha256,
+        record.created_at.isoformat(),
+    )

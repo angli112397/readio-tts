@@ -7,15 +7,14 @@ services:
     environment:
       is_half: "true"
     shm_size: "16g"
-    tty: true
-    stdin_open: true
+    configs:
+      - source: gpt_start_api
+        target: /run/readio/start-api.sh
+      - source: gpt_tts_config
+        target: /run/readio/tts_infer.yaml
     volumes:
-      - ./GPT-SoVITS:/workspace/GPT-SoVITS/GPT_SoVITS/pretrained_models
-      - ./deployment/gpt_sovits/tts_infer.yaml:/run/readio/tts_infer.yaml:ro
-      - ./deployment/gpt_sovits/start-api.sh:/run/readio/start-api.sh:ro
-      - ${READIO_DATA_DIR:?Set READIO_DATA_DIR to a local non-synchronized folder}:/workspace/GPT-SoVITS/job-data:ro
-    ports:
-      - "${READIO_GPT_BIND:-127.0.0.1}:9880:9880"
+      - ${READIO_GPT_MODELS_DIR:?Set READIO_GPT_MODELS_DIR to the local GPT-SoVITS model folder}:/workspace/GPT-SoVITS/GPT_SoVITS/pretrained_models:ro
+      - ${READIO_DATA_DIR:?Set READIO_DATA_DIR to a local non-synchronized folder}/jobs:/var/lib/readio/jobs:ro
     command: ["bash", "/run/readio/start-api.sh"]
     deploy:
       resources:
@@ -26,7 +25,6 @@ services:
               capabilities: [gpu]
     networks:
       - backend
-      - ingress
 
   gateway:
     depends_on:
@@ -37,3 +35,9 @@ services:
     depends_on:
       gpt-sovits:
         condition: service_started
+
+configs:
+  gpt_start_api:
+    file: ./deployment/gpt_sovits/start-api.sh
+  gpt_tts_config:
+    file: ./deployment/gpt_sovits/tts_infer.yaml

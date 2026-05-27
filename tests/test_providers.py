@@ -15,7 +15,10 @@ def test_gpt_sovits_uses_the_job_reference_snapshot(tmp_path: Path) -> None:
     input_dir = tmp_path / "jobs" / "job-id" / "input"
     input_dir.mkdir(parents=True)
     (input_dir / "reference.wav").write_bytes(b"wav-bytes")
-    (input_dir / "reference.lab").write_text("Hello prompt.", encoding="utf-8")
+    (input_dir / "voice.json").write_text(
+        '{"reference_language":"en","transcript":"Hello prompt."}',
+        encoding="utf-8",
+    )
 
     def handle(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/tts":
@@ -31,14 +34,13 @@ def test_gpt_sovits_uses_the_job_reference_snapshot(tmp_path: Path) -> None:
             provider = GptSoVitsProvider(
                 Settings(
                     data_dir=tmp_path,
+                    api_token="test-readio-api-token",
                     gpt_job_data_remote_dir="job-data/jobs",
-                    gpt_text_lang="zh",
-                    gpt_prompt_lang="zh",
                     gpt_text_split_method="cut0",
                 ),
                 client=client,
             )
-            assert await provider.synthesize("Test text.", "job-id") == b"wav"
+            assert await provider.synthesize("Test text.", "job-id", "en") == b"wav"
 
     asyncio.run(exercise())
 
@@ -47,8 +49,8 @@ def test_gpt_sovits_uses_the_job_reference_snapshot(tmp_path: Path) -> None:
             "text": "Test text.",
             "ref_audio_path": "job-data/jobs/job-id/input/reference.wav",
             "prompt_text": "Hello prompt.",
-            "text_lang": "zh",
-            "prompt_lang": "zh",
+            "text_lang": "en",
+            "prompt_lang": "en",
             "text_split_method": "cut0",
             "batch_size": 1,
             "top_k": 15,
@@ -70,7 +72,10 @@ def test_gpt_sovits_failure_includes_response_detail_and_logs_path(
     input_dir = tmp_path / "jobs" / "job-id" / "input"
     input_dir.mkdir(parents=True)
     (input_dir / "reference.wav").write_bytes(b"wav-bytes")
-    (input_dir / "reference.lab").write_text("Prompt.", encoding="utf-8")
+    (input_dir / "voice.json").write_text(
+        '{"reference_language":"zh","transcript":"Prompt."}',
+        encoding="utf-8",
+    )
 
     def handle(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(400, text="reference audio is not readable")
@@ -81,11 +86,15 @@ def test_gpt_sovits_failure_includes_response_detail_and_logs_path(
             base_url="http://gpt-sovits",
         ) as client:
             provider = GptSoVitsProvider(
-                Settings(data_dir=tmp_path, gpt_job_data_remote_dir="job-data/jobs"),
+                Settings(
+                    data_dir=tmp_path,
+                    api_token="test-readio-api-token",
+                    gpt_job_data_remote_dir="job-data/jobs",
+                ),
                 client=client,
             )
             with pytest.raises(SynthesisError) as raised:
-                await provider.synthesize("A short sentence.", "job-id")
+                await provider.synthesize("A short sentence.", "job-id", "en")
             assert raised.value.code == "tts_request_rejected"
             assert not raised.value.retryable
             assert (

@@ -17,10 +17,19 @@ Android owns chapter text, sentence segmentation, downloaded artifacts, and
 offline playback. The gateway owns asynchronous synthesis and temporary
 server-side job data.
 
+`READIO_API_TOKEN` is required at startup. Android includes
+`Authorization: Bearer <token>` in every `/v1/*` request. `/health` remains
+unauthenticated for the container health check.
+
 The complete public API is:
 
 | Method | Path | Purpose |
 | --- | --- | --- |
+| `POST` | `/v1/voices` | Upload one reference voice WAV and its transcript. |
+| `GET` | `/v1/voices` | List installed voices. |
+| `GET` | `/v1/voices/{voice_id}` | Get voice metadata. |
+| `GET` | `/v1/voices/{voice_id}/audio` | Download the uploaded reference WAV. |
+| `DELETE` | `/v1/voices/{voice_id}` | Delete a voice from future job selection. |
 | `POST` | `/v1/jobs` | Submit one already-segmented chapter for synthesis. |
 | `GET` | `/v1/jobs/{job_id}` | Poll progress and obtain artifact URLs after success. |
 | `GET` | `/v1/jobs/{job_id}/audio` | Download the completed chapter WAV. |
@@ -40,6 +49,7 @@ The complete public API is:
 
 ```http
 POST /v1/jobs
+Authorization: Bearer <token>
 Idempotency-Key: book-1-chapter-12-reader-v1
 Content-Type: application/json
 ```
@@ -48,6 +58,7 @@ Content-Type: application/json
 {
   "chapter_id": "book-1/chapter-12",
   "voice_id": "my_mandarin_narrator",
+  "text_language": "zh",
   "sentence_gap_ms": 600,
   "sentences": [
     {
@@ -68,9 +79,11 @@ Fields:
 
 | Field | Required | Meaning |
 | --- | --- | --- |
+| `Authorization` header | yes | `Bearer <READIO_API_TOKEN>` for all `/v1/*` requests. |
 | `Idempotency-Key` header | yes | Stable key for this chapter, voice, and settings. Retrying the same submission returns the existing job. |
 | `chapter_id` | yes | Android's chapter identifier. |
-| `voice_id` | yes | Folder name under `references/gpt/`; use ASCII letters, digits, `_`, or `-`. |
+| `voice_id` | yes | Installed voice ID; use ASCII letters, digits, `_`, or `-`. |
+| `text_language` | yes | Language of the chapter text: `zh`, `en`, `ja`, `ko`, or `yue`. |
 | `sentence_gap_ms` | no | Silence between generated sentences, default `600`, range `0-5000`. |
 | `sentences[].id` | yes | Stable Android sentence identifier; unique within the chapter. |
 | `sentences[].text` | yes | Text sent to GPT-SoVITS. |
@@ -117,10 +130,29 @@ Queued response:
     "sentences_completed": 0,
     "sentences_total": 2210
   },
+  "queue_position": 1,
   "created_at": "2026-05-26T08:00:00Z",
   "updated_at": "2026-05-26T08:00:00Z"
 }
 ```
+
+`queue_position` is returned only for `queued` jobs. Position `1` means the
+job will run next; a currently running job occupies position `1`, so the
+first waiting job is then position `2`.
+
+If a queued or running task cannot advance because no worker heartbeat has
+been received recently, the same response includes:
+
+```json
+{
+  "state": "queued",
+  "queue_position": 1,
+  "blocked_by": "worker_unavailable"
+}
+```
+
+Android may show a service-not-running message while continuing to poll.
+`blocked_by` is diagnostic state, not terminal failure.
 
 While processing:
 
@@ -219,6 +251,7 @@ The manifest is intentionally separate from status polling:
 {
   "chapter_id": "book-1/chapter-12",
   "voice_id": "my_mandarin_narrator",
+  "text_language": "zh",
   "duration_ms": 18000000,
   "sentence_gap_ms": 600,
   "sentences": [
@@ -261,6 +294,7 @@ Successful jobs that are never deleted expire after
 
 | Request | Status | Android Handling |
 | --- | --- | --- |
+| Missing or incorrect API token | `401` | Ask the user to check server connection settings. |
 | Valid `POST /v1/jobs` | `202` | Persist `job_id`, then begin polling. |
 | Repeated identical `Idempotency-Key` | `202` | Reuse the returned existing `job_id`. |
 | Reused key with different request body | `409` | Treat as an app bug or create an intentional new submission with a new key. |
@@ -274,8 +308,12 @@ Error codes:
 
 | Code | Returned For | Android Handling |
 | --- | --- | --- |
+| `unauthorized` | Missing or incorrect bearer token. | Check server connection settings; do not poll. |
 | `invalid_request` | Invalid JSON fields or missing required input. | Correct the request; do not poll. |
-| `invalid_voice_profile` | The selected local narrator is missing or invalid. | Prompt for another installed voice. |
+| `voice_unavailable` | A selected job voice is missing or its saved audio is missing. | Prompt for another installed voice. |
+| `invalid_voice_audio` | A voice upload is not a valid PCM WAV. | Ask the user to upload a valid WAV. |
+| `voice_not_found` | A queried voice no longer exists. | Remove stale local voice selection. |
+| `voice_audio_not_found` | Saved voice metadata exists but its audio is absent. | Delete and upload the voice again. |
 | `chapter_too_large` | Text exceeds the server size limit. | Split into separate artifacts. |
 | `idempotency_conflict` | A key was reused with different content. | Generate a new key for the new request. |
 | `job_not_found` | A queried job no longer exists. | Remove stale local tracking. |
@@ -285,6 +323,7 @@ Error codes:
 | `tts_unavailable` | GPT-SoVITS was unavailable after one retry. | Show/log failure; allow a new submission. |
 | `invalid_tts_response` | GPT-SoVITS returned unusable audio. | Show/log failure; allow a new submission. |
 | `reference_snapshot_missing` | Job-local narrator files are missing. | Delete the job and submit again. |
+| `reference_snapshot_invalid` | Job-local voice snapshot is invalid. | Delete the job and resubmit. |
 | `artifact_publication_failed` | Final WAV or manifest could not be published. | Delete and submit again after checking storage. |
 | `internal_error` | Unexpected server failure. | Show/log failure and inspect server logs. |
 
@@ -305,6 +344,10 @@ worker restart does not create a new Android-visible state: a `queued` or
 `running` job continues from saved sentence WAV checkpoints when the single
 worker runs again.
 
+The worker records one small global heartbeat in SQLite while running.
+`GET /v1/jobs/{job_id}` uses it only to expose
+`blocked_by: "worker_unavailable"` for active work that cannot advance.
+
 ## Server Processing
 
 The API process stores task metadata in local SQLite and returns status
@@ -316,8 +359,8 @@ running task resumes from its existing consecutive segment files.
 
 When a job is submitted, its selected reference audio and transcript are
 copied into `READIO_DATA_DIR/jobs/<job_id>/input/`. This snapshot prevents
-changes to `references/gpt/<voice_id>/` from changing a chapter midway
-through generation.
+voice deletion or replacement from changing a chapter midway through
+generation.
 
 Do not change the GPT-SoVITS model configuration while a job is running.
 Model upgrades should be applied after active jobs have finished or been
@@ -326,22 +369,74 @@ deleted.
 The final format remains WAV because it preserves predictable seek timing for
 offline synchronized reading.
 
+### Stored Metadata
+
+SQLite keeps job state and a minimal immutable `voices` catalog. The voice
+catalog is prepared for client-managed reference uploads:
+
+| Voice field | Purpose |
+| --- | --- |
+| `voice_id` | Stable ID selected by synthesis jobs. |
+| `display_name` | Name shown by the client. |
+| `reference_language` | Language spoken in the reference recording. |
+| `transcript` | Reference recording text supplied to GPT-SoVITS as `prompt_text`. |
+| `duration_ms` | Basic upload validation and diagnostics. |
+| `audio_size_bytes`, `audio_sha256` | Local storage and integrity diagnostics. |
+| `created_at` | Display order and troubleshooting. |
+
+Voice records are immutable: they are created or deleted, not edited.
+Reference audio is stored at `READIO_DATA_DIR/voices/<voice_id>/reference.wav`,
+so the database does not need an audio path field. A submitted job immediately
+snapshots its voice input; deleting a voice does not interrupt existing jobs.
+
 ## GPT-SoVITS Setup
 
-Voice samples live under `references/gpt/`:
+Upload a voice with `multipart/form-data`:
 
-```text
-references/gpt/my_mandarin_narrator/
-  sample_0004.wav
-  sample_0004.lab
+```http
+POST /v1/voices
+Authorization: Bearer <token>
+Content-Type: multipart/form-data
 ```
 
-The first audio file with a matching `.lab` or `.txt` transcript is supplied
-to GPT-SoVITS as the selected voice profile.
+| Field | Meaning |
+| --- | --- |
+| `display_name` | Client-facing name for the voice. |
+| `reference_language` | Language spoken in the uploaded WAV: `zh`, `en`, `ja`, `ko`, or `yue`. |
+| `transcript` | Exact spoken text of the reference WAV. |
+| `audio` | Non-empty PCM WAV reference file. |
 
-GPT-SoVITS weights are kept locally in `GPT-SoVITS/` and mounted into the
-container by [compose.gpt.yaml](./compose.gpt.yaml). The model directory and
-voice recordings are ignored by Git.
+The job `text_language` and voice `reference_language` may differ. For
+example, to use a Chinese narrator voice for an English book:
+
+```json
+{
+  "chapter_id": "english-book/chapter-1",
+  "voice_id": "my_mandarin_narrator",
+  "text_language": "en",
+  "sentences": [
+    {
+      "id": "s000001",
+      "text": "The rain had stopped before midnight."
+    }
+  ]
+}
+```
+
+For the most natural English narration, upload an English reference recording
+with `reference_language=en`.
+
+### Voice Preview
+
+Voice preview uses the ordinary job API. After uploading a voice, Android can
+submit a short preview passage with that `voice_id`, poll it, download and
+play the result, then either retain the voice or delete the voice and preview
+job. The gateway does not maintain a separate preview workflow.
+
+GPT-SoVITS weights are stored outside this repository under
+`READIO_GPT_MODELS_DIR` and mounted read-only into the container by
+[compose.gpt.yaml](./compose.gpt.yaml). Voice recordings and job data are
+stored under `READIO_DATA_DIR`.
 
 ### Model Configuration
 
@@ -350,19 +445,18 @@ narration quality in local listening tests. It requires these local pretrained
 assets:
 
 ```text
-GPT-SoVITS/
+models/gpt-sovits/
   s1v3.ckpt
   v2Pro/s2Gv2ProPlus.pth
 ```
 
-The tracked runtime configuration is stored in
-`deployment/gpt_sovits/tts_infer.yaml`. GPT-SoVITS writes back to its runtime
-config while initializing, so Compose copies this template to a writable
-temporary file inside the container before starting the API server.
-The startup script in `deployment/gpt_sovits/start-api.sh` exposes the
-`G2PWModel` already bundled in the upstream image at GPT-SoVITS's expected
-Chinese frontend path. This avoids both an additional local model copy and a
-first-request model download.
+The tracked runtime configuration and startup adapter are stored in
+`deployment/gpt_sovits/` and injected through Compose `configs`; they are not
+external user data. GPT-SoVITS writes back to its runtime configuration while
+initializing, so the adapter copies the template to a writable temporary
+file. When required by the pinned upstream image, it also exposes the bundled
+`G2PWModel` at GPT-SoVITS's expected Chinese frontend path. This does not
+require a separate host mount.
 
 Start GPT-SoVITS:
 
@@ -378,8 +472,7 @@ One warm-run result on the RTX 4060 Laptop GPU was:
 | --- | ---: | ---: | ---: |
 | `v2ProPlus` | `35.44 s` | `15.06 s` | `0.425` |
 
-Generated local auditions are stored under `data/samples/`, which is ignored
-by Git.
+Generated local auditions should be stored under `READIO_DATA_DIR/samples/`.
 
 ## Local Development
 
@@ -390,7 +483,8 @@ terminals:
 docker compose -f compose.yaml -f compose.gpt.yaml -f compose.gpt.dev.yaml up -d gpt-sovits
 .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-$env:READIO_DATA_DIR = Join-Path $env:LOCALAPPDATA "ReadioTTS"
+$env:READIO_DATA_DIR = Join-Path $env:LOCALAPPDATA "ReadioTTS\data"
+$env:READIO_GPT_BASE_URL = "http://127.0.0.1:9880"
 uvicorn readio_tts.api:app --reload --host 0.0.0.0 --port 8090
 ```
 
@@ -399,7 +493,8 @@ Second terminal:
 ```powershell
 cd C:\Users\angli\OneDrive\Documents\readio-tts
 .\.venv\Scripts\Activate.ps1
-$env:READIO_DATA_DIR = Join-Path $env:LOCALAPPDATA "ReadioTTS"
+$env:READIO_DATA_DIR = Join-Path $env:LOCALAPPDATA "ReadioTTS\data"
+$env:READIO_GPT_BASE_URL = "http://127.0.0.1:9880"
 python -m readio_tts.worker
 ```
 
@@ -411,11 +506,16 @@ Relevant `.env` values:
 
 ```dotenv
 READIO_PROVIDER=gpt
-READIO_DATA_DIR=C:/Users/angli/AppData/Local/ReadioTTS
-READIO_GPT_BASE_URL=http://127.0.0.1:9880
+READIO_DATA_DIR=C:/Users/angli/AppData/Local/ReadioTTS/data
+READIO_GPT_MODELS_DIR=C:/Users/angli/AppData/Local/ReadioTTS/models/gpt-sovits
+READIO_API_TOKEN=replace-with-a-long-random-token
+READIO_WORKER_STALE_SECONDS=30
 READIO_GPT_MODEL_REVISION=v2ProPlus
-READIO_GPT_REFERENCE_DIR=references/gpt
 ```
+
+For local Python development, set `READIO_GPT_BASE_URL` in the terminal as
+shown above. For the full Docker stack, Compose fixes its container-internal
+GPT URL automatically.
 
 Check readiness:
 
@@ -433,8 +533,25 @@ docker compose -f compose.yaml -f compose.gpt.yaml up -d --build
 ```
 
 The stack starts `gateway`, one `worker`, and `gpt-sovits`. Only the gateway
-is published to the laptop LAN; GPT-SoVITS is exposed on localhost for
-development access.
+is published to the laptop LAN. GPT-SoVITS is internal in this deployment;
+the development overlay publishes it on localhost only when running the
+gateway or worker outside Docker.
+
+Persistent host storage is limited to:
+
+```text
+ReadioTTS/
+  data/
+    readio.sqlite3
+    voices/
+    jobs/
+  models/
+    gpt-sovits/
+```
+
+`data/` contains user and task data. `models/` contains replaceable downloaded
+model assets. The GPT-SoVITS container sees its model directory and
+`data/jobs/` read-only; it does not read SQLite or the original voice store.
 
 ## Tests
 

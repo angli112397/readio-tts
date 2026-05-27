@@ -3,15 +3,20 @@ import asyncio
 from .config import Settings
 from .jobs import JobManager, JobWorker
 from .providers import create_provider
-from .repository import JobRepository
+from .repository import JobRepository, VoiceRepository
+from .voices import VoiceManager
 
 
 def main() -> None:
     settings = Settings()
+    database_path = settings.data_dir / "readio.sqlite3"
     manager = JobManager(
-        repository=JobRepository(settings.data_dir / "readio.sqlite3"),
+        repository=JobRepository(database_path),
         jobs_dir=settings.data_dir / "jobs",
-        reference_dir=settings.gpt_reference_dir,
+        voice_manager=VoiceManager(
+            VoiceRepository(database_path),
+            settings.data_dir / "voices",
+        ),
         model_revision=settings.gpt_model_revision,
         max_chapter_characters=settings.max_chapter_characters,
         job_retention_days=settings.job_retention_days,
