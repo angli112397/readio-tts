@@ -19,6 +19,9 @@ class VoiceUnavailableError(ValueError):
 
 
 class VoiceManager:
+    min_duration_ms = 3_000
+    max_duration_ms = 10_000
+
     def __init__(
         self,
         repository: VoiceRepository,
@@ -40,6 +43,10 @@ class VoiceManager:
         if len(audio) > self.max_audio_bytes:
             raise InvalidVoiceAudioError("Reference audio exceeds the upload size limit.")
         duration_ms = _wav_duration_ms(audio)
+        if not self.min_duration_ms <= duration_ms <= self.max_duration_ms:
+            raise InvalidVoiceAudioError(
+                "Reference audio duration must be between 3 and 10 seconds."
+            )
         voice_id = str(uuid4())
         record = VoiceRecord(
             voice_id=voice_id,

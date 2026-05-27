@@ -53,13 +53,13 @@ def install_manager(tmp_path: Path, monkeypatch) -> JobManager:
     return manager
 
 
-def make_wav() -> bytes:
+def make_wav(duration_ms: int = 4_000) -> bytes:
     output = BytesIO()
     with wave.open(output, "wb") as writer:
         writer.setnchannels(1)
         writer.setsampwidth(2)
         writer.setframerate(1_000)
-        writer.writeframes(struct.pack("<h", 0) * 500)
+        writer.writeframes(struct.pack("<h", 0) * duration_ms)
     return output.getvalue()
 
 
@@ -280,7 +280,7 @@ def test_voice_upload_list_audio_and_delete(tmp_path: Path, monkeypatch) -> None
         assert created.status_code == 201
         voice_id = created.json()["voice_id"]
         assert created.json()["reference_language"] == "en"
-        assert created.json()["duration_ms"] == 500
+        assert created.json()["duration_ms"] == 4_000
         assert client.get("/v1/voices").json()[0]["voice_id"] == voice_id
         assert client.get(f"/v1/voices/{voice_id}/audio").status_code == 200
         assert client.delete(f"/v1/voices/{voice_id}").status_code == 204
@@ -301,6 +301,30 @@ def test_voice_upload_rejects_non_wav(tmp_path: Path, monkeypatch) -> None:
         )
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "invalid_voice_audio"
+
+
+def test_voice_upload_rejects_reference_duration_outside_engine_range(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    install_manager(tmp_path, monkeypatch)
+    with TestClient(api.app, headers=AUTH_HEADERS) as client:
+        for duration_ms in (1_000, 11_000):
+            response = client.post(
+                "/v1/voices",
+                data={
+                    "display_name": "Out Of Range Voice",
+                    "reference_language": "en",
+                    "transcript": "Reference prompt.",
+                },
+                files={"audio": ("voice.wav", make_wav(duration_ms), "audio/wav")},
+            )
+
+            assert response.status_code == 422
+            assert response.json()["error"] == {
+                "code": "invalid_voice_audio",
+                "message": "Reference audio duration must be between 3 and 10 seconds.",
+            }
 
 
 def test_deleting_voice_does_not_interrupt_submitted_job(tmp_path: Path, monkeypatch) -> None:
@@ -402,7 +426,7 @@ def test_failed_job_exposes_error_code_and_sentence_id(
     job, _ = manager.create_job(api.CreateJobRequest.model_validate(request_payload()), "failed")
     job.state = api.JobState.FAILED
     job.error_code = "tts_request_rejected"
-    job.error_message = "GPT-SoVITS rejected the synthesis request: invalid input."
+    job.error_message = "The speech engine rejected this sentence."
     job.error_sentence_id = "s2"
     manager.repository.save(job)
 
@@ -412,6 +436,6 @@ def test_failed_job_exposes_error_code_and_sentence_id(
     assert result.status_code == 200
     assert result.json()["error"] == {
         "code": "tts_request_rejected",
-        "message": "GPT-SoVITS rejected the synthesis request: invalid input.",
+        "message": "The speech engine rejected this sentence.",
         "sentence_id": "s2",
     }

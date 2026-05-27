@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     job_retention_days: int = Field(default=7, ge=1, le=365)
     api_token: str = Field(min_length=16)
     worker_stale_seconds: float = Field(default=30.0, ge=5.0, le=300.0)
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
     gpt_base_url: str = "http://127.0.0.1:9880"
     gpt_model_revision: str = "v2ProPlus"

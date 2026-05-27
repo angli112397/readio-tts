@@ -1,14 +1,25 @@
 import asyncio
+import logging
 
 from .config import Settings
 from .jobs import JobManager, JobWorker
+from .logging_config import configure_logging
 from .providers import create_provider
 from .repository import JobRepository, VoiceRepository
 from .voices import VoiceManager
 
 
+logger = logging.getLogger("readio_tts.worker")
+
+
 def main() -> None:
     settings = Settings()
+    configure_logging(settings.log_level)
+    logger.info(
+        "Worker starting: provider=%s log_level=%s",
+        settings.provider,
+        settings.log_level,
+    )
     database_path = settings.data_dir / "readio.sqlite3"
     manager = JobManager(
         repository=JobRepository(database_path),

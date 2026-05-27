@@ -35,6 +35,10 @@ class IdempotencyConflictError(ValueError):
     pass
 
 
+class _JobCancelled(Exception):
+    pass
+
+
 class JobFiles:
     def __init__(self, jobs_dir: Path, job_id: str) -> None:
         self.root = jobs_dir / job_id
@@ -202,7 +206,7 @@ class JobWorker:
             request = self.manager.load_request(record.job_id)
             files.segments.mkdir(parents=True, exist_ok=True)
             if self._cancelled(record.job_id):
-                self.manager.purge(record.job_id)
+                self._purge_cancelled(record.job_id)
                 return
             completed = _completed_segment_prefix(files.segments, record.total_sentences)
             record.state = JobState.RUNNING
@@ -211,10 +215,16 @@ class JobWorker:
             record.error_message = None
             record.error_sentence_id = None
             self._touch(record)
+            logger.info(
+                "Job processing started: job_id=%s sentences_completed=%s sentences_total=%s",
+                record.job_id,
+                record.completed_sentences,
+                record.total_sentences,
+            )
 
             for index in range(completed, record.total_sentences):
                 if self._cancelled(record.job_id):
-                    self.manager.purge(record.job_id)
+                    self._purge_cancelled(record.job_id)
                     return
                 sentence = request.sentences[index]
                 active_sentence_id = sentence.id
@@ -224,7 +234,7 @@ class JobWorker:
                     request.text_language,
                 )
                 if self._cancelled(record.job_id):
-                    self.manager.purge(record.job_id)
+                    self._purge_cancelled(record.job_id)
                     return
                 temporary = files.segments / f"{index:06d}.wav.tmp"
                 segment = files.segments / f"{index:06d}.wav"
@@ -240,13 +250,21 @@ class JobWorker:
                 request,
             )
             if self._cancelled(record.job_id):
-                self.manager.purge(record.job_id)
+                self._purge_cancelled(record.job_id)
                 return
             record.state = JobState.SUCCEEDED
             record.audio_size_bytes = size_bytes
             record.audio_sha256 = digest
             self._touch(record)
             await asyncio.to_thread(shutil.rmtree, files.segments, True)
+            logger.info(
+                "Job succeeded: job_id=%s sentences_total=%s audio_size_bytes=%s",
+                record.job_id,
+                record.total_sentences,
+                record.audio_size_bytes,
+            )
+        except _JobCancelled:
+            self._purge_cancelled(record.job_id)
         except SynthesisError as exc:
             files.partial_audio.unlink(missing_ok=True)
             record.state = JobState.FAILED
@@ -254,6 +272,12 @@ class JobWorker:
             record.error_message = exc.message
             record.error_sentence_id = active_sentence_id
             self._touch(record)
+            logger.warning(
+                "Job failed: job_id=%s error_code=%s sentence_id=%s",
+                record.job_id,
+                record.error_code,
+                record.error_sentence_id,
+            )
         except Exception:
             files.partial_audio.unlink(missing_ok=True)
             logger.exception("Job failed unexpectedly: job_id=%s", record.job_id)
@@ -279,10 +303,16 @@ class JobWorker:
             if not exc.retryable:
                 raise
             await asyncio.sleep(2)
+            if self._cancelled(job_id):
+                raise _JobCancelled
             return await self.provider.synthesize(text, job_id, text_language)
 
     def _cancelled(self, job_id: str) -> bool:
         return self.manager.repository.get(job_id) is None
+
+    def _purge_cancelled(self, job_id: str) -> None:
+        logger.info("Job cancellation observed by worker: job_id=%s", job_id)
+        self.manager.purge(job_id)
 
     def _touch(self, record: JobRecord) -> None:
         now = datetime.now(UTC)

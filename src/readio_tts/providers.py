@@ -103,7 +103,7 @@ class GptSoVitsProvider:
             if response.status_code < 500:
                 raise SynthesisError(
                     "tts_request_rejected",
-                    f"GPT-SoVITS rejected the synthesis request: {detail}",
+                    "The speech engine rejected this sentence.",
                 )
             raise SynthesisError(
                 "tts_unavailable",

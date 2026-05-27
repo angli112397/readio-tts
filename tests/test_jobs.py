@@ -310,7 +310,7 @@ def test_non_retryable_sentence_failure_is_recorded_without_retry(tmp_path: Path
             self.calls += 1
             raise SynthesisError(
                 "tts_request_rejected",
-                "GPT-SoVITS rejected the synthesis request: invalid prompt.",
+                "The speech engine rejected this sentence.",
             )
 
     async def exercise() -> None:
@@ -328,6 +328,39 @@ def test_non_retryable_sentence_failure_is_recorded_without_retry(tmp_path: Path
     asyncio.run(exercise())
 
 
+def test_cancelling_during_retry_delay_does_not_retry_sentence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class RetryableProvider(MockSpeechProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def synthesize(self, text: str, job_id: str, text_language: str) -> bytes:
+            self.calls += 1
+            raise SynthesisError(
+                "tts_unavailable",
+                "GPT-SoVITS is unavailable.",
+                retryable=True,
+            )
+
+    async def exercise() -> None:
+        manager = make_manager(tmp_path)
+        job, _ = manager.create_job(make_request(), "cancel-during-retry")
+        provider = RetryableProvider()
+
+        async def cancel_instead_of_sleep(_seconds: float) -> None:
+            manager.delete(job.job_id)
+
+        monkeypatch.setattr(jobs_module.asyncio, "sleep", cancel_instead_of_sleep)
+        await JobWorker(manager, provider).run_once()
+
+        assert provider.calls == 1
+        assert manager.get_job(job.job_id) is None
+
+    asyncio.run(exercise())
+
+
 def test_delete_succeeded_job_removes_artifacts_and_metadata(tmp_path: Path) -> None:
     async def exercise() -> None:
         manager = make_manager(tmp_path)
@@ -335,6 +368,37 @@ def test_delete_succeeded_job_removes_artifacts_and_metadata(tmp_path: Path) -> 
         await JobWorker(manager, MockSpeechProvider()).run_once()
         manager.delete(job.job_id)
 
+        assert manager.get_job(job.job_id) is None
+        assert not manager.files(job.job_id).root.exists()
+
+    asyncio.run(exercise())
+
+
+def test_cancelling_running_job_does_not_start_the_next_sentence(tmp_path: Path) -> None:
+    class BlockingProvider(MockSpeechProvider):
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.texts: list[str] = []
+
+        async def synthesize(self, text: str, job_id: str, text_language: str) -> bytes:
+            self.texts.append(text)
+            self.started.set()
+            await self.release.wait()
+            return await super().synthesize(text, job_id, text_language)
+
+    async def exercise() -> None:
+        manager = make_manager(tmp_path)
+        job, _ = manager.create_job(make_request(), "cancel-running")
+        provider = BlockingProvider()
+        processing = asyncio.create_task(JobWorker(manager, provider).run_once())
+        await provider.started.wait()
+
+        manager.delete(job.job_id)
+        provider.release.set()
+        await processing
+
+        assert provider.texts == ["Hello."]
         assert manager.get_job(job.job_id) is None
         assert not manager.files(job.job_id).root.exists()
 

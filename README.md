@@ -8,7 +8,7 @@ The basic behavior is:
 
 - Android receives a complete chapter artifact that supports random seeking.
 - The gateway retains output only until Android confirms it has persisted it.
-- Sentence audio is checkpointed internally so an interrupted gateway can
+- Sentence audio is checkpointed internally so an interrupted worker can
   continue a long-running chapter instead of starting over.
 
 ## Android API
@@ -25,7 +25,7 @@ The complete public API is:
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/v1/voices` | Upload one reference voice WAV and its transcript. |
+| `POST` | `/v1/voices` | Upload one 3-10 second reference WAV and its transcript. |
 | `GET` | `/v1/voices` | List installed voices. |
 | `GET` | `/v1/voices/{voice_id}` | Get voice metadata. |
 | `GET` | `/v1/voices/{voice_id}/audio` | Download the uploaded reference WAV. |
@@ -45,13 +45,18 @@ The complete public API is:
 5. After both files are safely persisted locally, Android calls `DELETE /v1/jobs/{job_id}`.
 6. When state is `failed`, Android displays or logs `error`, then calls `DELETE`; a user retry is a new submission.
 
+When the user explicitly cancels a running generation, Android calls
+`DELETE /v1/jobs/{job_id}` and treats `204` as final for that user action.
+It must not automatically submit a replacement job for the same chapter until
+the user requests generation again.
+
 ### Create A Job
 
 ```http
 POST /v1/jobs
 Authorization: Bearer <token>
 Idempotency-Key: book-1-chapter-12-reader-v1
-Content-Type: application/json
+Content-Type: application/json; charset=utf-8
 ```
 
 ```json
@@ -88,6 +93,10 @@ Fields:
 | `sentences[].id` | yes | Stable Android sentence identifier; unique within the chapter. |
 | `sentences[].text` | yes | Text sent to GPT-SoVITS. |
 | `sentences[].paragraph_index` | no | Paragraph position, default `0`. |
+
+Android sends JSON request bodies as UTF-8. This matters for Chinese,
+Japanese, Korean, and Cantonese text: incorrect client encoding can result in
+valid requests whose synthesized speech does not match the displayed text.
 
 Response: `202 Accepted`
 
@@ -287,6 +296,8 @@ Response: `204 No Content`. Deletion is idempotent and immediately removes
 the job record and its cached files. If a GPT-SoVITS sentence request is
 already running, that single request cannot be interrupted; its response is
 discarded when it returns.
+For user cancellation, Android must stop polling and must not automatically
+create another job for the same chapter after this response.
 Successful jobs that are never deleted expire after
 `READIO_JOB_RETENTION_DAYS`.
 
@@ -311,7 +322,7 @@ Error codes:
 | `unauthorized` | Missing or incorrect bearer token. | Check server connection settings; do not poll. |
 | `invalid_request` | Invalid JSON fields or missing required input. | Correct the request; do not poll. |
 | `voice_unavailable` | A selected job voice is missing or its saved audio is missing. | Prompt for another installed voice. |
-| `invalid_voice_audio` | A voice upload is not a valid PCM WAV. | Ask the user to upload a valid WAV. |
+| `invalid_voice_audio` | A voice upload is not a valid 3-10 second PCM WAV. | Ask the user to upload a valid reference sample. |
 | `voice_not_found` | A queried voice no longer exists. | Remove stale local voice selection. |
 | `voice_audio_not_found` | Saved voice metadata exists but its audio is absent. | Delete and upload the voice again. |
 | `chapter_too_large` | Text exceeds the server size limit. | Split into separate artifacts. |
@@ -319,7 +330,7 @@ Error codes:
 | `job_not_found` | A queried job no longer exists. | Remove stale local tracking. |
 | `artifact_not_ready` | Download requested before `succeeded`. | Continue polling. |
 | `artifact_not_found` | A completed artifact is missing on disk. | Discard the job and resubmit if needed. |
-| `tts_request_rejected` | GPT-SoVITS rejected sentence/reference input. | Show/log the message; resubmit after fixing the input. |
+| `tts_request_rejected` | The speech engine rejected sentence/reference input. | Show the message; inspect server logs while fixing the input. |
 | `tts_unavailable` | GPT-SoVITS was unavailable after one retry. | Show/log failure; allow a new submission. |
 | `invalid_tts_response` | GPT-SoVITS returned unusable audio. | Show/log failure; allow a new submission. |
 | `reference_snapshot_missing` | Job-local narrator files are missing. | Delete the job and submit again. |
@@ -339,10 +350,11 @@ Android only needs four observable states:
 | `failed` | Generation stopped with a terminal error. | Show or log `error`, then `DELETE`; resubmit only if desired. |
 
 The worker retries one sentence synthesis call once only for temporary
-GPT-SoVITS availability failures. Invalid input is failed immediately. A
-worker restart does not create a new Android-visible state: a `queued` or
-`running` job continues from saved sentence WAV checkpoints when the single
-worker runs again.
+GPT-SoVITS availability failures. If the task is cancelled while waiting to
+retry, that retry is not sent. Invalid input is failed immediately. A worker
+restart does not create a new Android-visible state: a `queued` or `running`
+job continues from saved sentence WAV checkpoints when the single worker runs
+again.
 
 The worker records one small global heartbeat in SQLite while running.
 `GET /v1/jobs/{job_id}` uses it only to expose
@@ -380,7 +392,7 @@ catalog is prepared for client-managed reference uploads:
 | `display_name` | Name shown by the client. |
 | `reference_language` | Language spoken in the reference recording. |
 | `transcript` | Reference recording text supplied to GPT-SoVITS as `prompt_text`. |
-| `duration_ms` | Basic upload validation and diagnostics. |
+| `duration_ms` | Enforces GPT-SoVITS's 3-10 second reference range and supports diagnostics. |
 | `audio_size_bytes`, `audio_sha256` | Local storage and integrity diagnostics. |
 | `created_at` | Display order and troubleshooting. |
 
@@ -404,7 +416,7 @@ Content-Type: multipart/form-data
 | `display_name` | Client-facing name for the voice. |
 | `reference_language` | Language spoken in the uploaded WAV: `zh`, `en`, `ja`, `ko`, or `yue`. |
 | `transcript` | Exact spoken text of the reference WAV. |
-| `audio` | Non-empty PCM WAV reference file. |
+| `audio` | PCM WAV reference file between 3 and 10 seconds long. |
 
 The job `text_language` and voice `reference_language` may differ. For
 example, to use a Chinese narrator voice for an English book:
@@ -502,6 +514,20 @@ Keep `READIO_DATA_DIR` outside OneDrive or another synchronized folder. It
 contains SQLite metadata, reference snapshots, sentence checkpoints, and
 completed artifacts. Run exactly one worker for the single local GPU.
 
+Development logs default to `INFO`. The gateway terminal prints accepted and
+deleted jobs; the worker terminal prints job start, completion, cancellation,
+and failure events. GPT-SoVITS retains its own inference output in Docker
+logs:
+
+```powershell
+docker compose -f compose.yaml -f compose.gpt.yaml -f compose.gpt.dev.yaml logs -f gpt-sovits
+```
+
+Set `READIO_LOG_LEVEL=DEBUG` before launching the local gateway and worker
+when additional application diagnostics are needed. Client responses expose
+stable error codes and safe messages; upstream GPT-SoVITS response details
+are recorded in server logs only.
+
 Relevant `.env` values:
 
 ```dotenv
@@ -509,6 +535,7 @@ READIO_PROVIDER=gpt
 READIO_DATA_DIR=C:/Users/angli/AppData/Local/ReadioTTS/data
 READIO_GPT_MODELS_DIR=C:/Users/angli/AppData/Local/ReadioTTS/models/gpt-sovits
 READIO_API_TOKEN=replace-with-a-long-random-token
+READIO_LOG_LEVEL=INFO
 READIO_WORKER_STALE_SECONDS=30
 READIO_GPT_MODEL_REVISION=v2ProPlus
 ```

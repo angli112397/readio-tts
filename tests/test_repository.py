@@ -65,3 +65,13 @@ def test_job_repository_records_worker_heartbeat(tmp_path: Path) -> None:
     repository.touch_worker(heartbeat)
 
     assert repository.worker_last_seen_at() == heartbeat
+
+
+def test_repository_closes_database_connections_after_operations(tmp_path: Path) -> None:
+    database_path = tmp_path / "readio.sqlite3"
+    repository = JobRepository(database_path)
+
+    repository.touch_worker()
+    database_path.unlink()
+
+    assert not database_path.exists()

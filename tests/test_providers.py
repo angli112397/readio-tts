@@ -65,7 +65,7 @@ def test_gpt_sovits_uses_the_job_reference_snapshot(tmp_path: Path) -> None:
     ]
 
 
-def test_gpt_sovits_failure_includes_response_detail_and_logs_path(
+def test_gpt_sovits_failure_exposes_stable_message_and_logs_detail(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -97,12 +97,10 @@ def test_gpt_sovits_failure_includes_response_detail_and_logs_path(
                 await provider.synthesize("A short sentence.", "job-id", "en")
             assert raised.value.code == "tts_request_rejected"
             assert not raised.value.retryable
-            assert (
-                str(raised.value)
-                == "GPT-SoVITS rejected the synthesis request: reference audio is not readable"
-            )
+            assert str(raised.value) == "The speech engine rejected this sentence."
 
     with caplog.at_level(logging.ERROR, logger="readio_tts.providers"):
         asyncio.run(exercise())
 
     assert "job-data/jobs/job-id/input/reference.wav" in caplog.text
+    assert "reference audio is not readable" in caplog.text

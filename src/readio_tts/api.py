@@ -11,6 +11,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .config import Settings
 from .jobs import ChapterTooLargeError, IdempotencyConflictError, JobManager
+from .logging_config import configure_logging
 from .models import (
     CreateJobRequest,
     CreateJobResponse,
@@ -30,6 +31,7 @@ from .voices import InvalidVoiceAudioError, VoiceManager, VoiceUnavailableError
 
 logger = logging.getLogger(__name__)
 settings = Settings()
+configure_logging(settings.log_level)
 database_path = settings.data_dir / "readio.sqlite3"
 voice_manager = VoiceManager(
     VoiceRepository(database_path),
@@ -172,7 +174,7 @@ async def create_job(
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1)],
 ) -> CreateJobResponse:
     try:
-        job, _created = manager.create_job(request, idempotency_key)
+        job, created = manager.create_job(request, idempotency_key)
     except ChapterTooLargeError as exc:
         raise ApiError(413, "chapter_too_large", str(exc)) from exc
     except IdempotencyConflictError as exc:
@@ -182,6 +184,12 @@ async def create_job(
     status_url = _absolute_url(http_request, f"/v1/jobs/{job.job_id}")
     response.headers["Location"] = status_url
     response.headers["Retry-After"] = "5"
+    logger.info(
+        "Job accepted: job_id=%s created=%s sentences_total=%s",
+        job.job_id,
+        created,
+        job.total_sentences,
+    )
     return CreateJobResponse(job_id=job.job_id, state=job.state, status_url=status_url)
 
 
@@ -252,7 +260,13 @@ async def get_manifest(job_id: str) -> FileResponse:
 
 @router.delete("/jobs/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_job(job_id: str) -> Response:
+    job = manager.get_job(job_id)
     manager.delete(job_id)
+    logger.info(
+        "Job deletion requested: job_id=%s prior_state=%s",
+        job_id,
+        job.state.value if job is not None else "not_found",
+    )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

@@ -1,4 +1,6 @@
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -12,7 +14,7 @@ class JobRepository:
         self._initialize()
 
     def create(self, record: JobRecord) -> None:
-        with self._connect() as connection:
+        with _connect(self._database_path) as connection:
             connection.execute(
                 """
                 INSERT INTO jobs (
@@ -26,7 +28,7 @@ class JobRepository:
             )
 
     def get(self, job_id: str) -> JobRecord | None:
-        with self._connect() as connection:
+        with _connect(self._database_path) as connection:
             row = connection.execute(
                 "SELECT * FROM jobs WHERE job_id = ?",
                 (job_id,),
@@ -34,7 +36,7 @@ class JobRepository:
         return self._record(row)
 
     def find_by_idempotency_key(self, key: str) -> JobRecord | None:
-        with self._connect() as connection:
+        with _connect(self._database_path) as connection:
             row = connection.execute(
                 "SELECT * FROM jobs WHERE idempotency_key = ?",
                 (key,),
@@ -42,7 +44,7 @@ class JobRepository:
         return self._record(row)
 
     def next_pending(self) -> JobRecord | None:
-        with self._connect() as connection:
+        with _connect(self._database_path) as connection:
             row = connection.execute(
                 """
                 SELECT * FROM jobs
@@ -61,7 +63,7 @@ class JobRepository:
     def queue_position(self, record: JobRecord) -> int | None:
         if record.state != JobState.QUEUED:
             return None
-        with self._connect() as connection:
+        with _connect(self._database_path) as connection:
             row = connection.execute(
                 """
                 SELECT COUNT(*) AS position FROM jobs
@@ -83,7 +85,7 @@ class JobRepository:
 
     def touch_worker(self, timestamp: datetime | None = None) -> None:
         value = (timestamp or datetime.now(UTC)).isoformat()
-        with self._connect() as connection:
+        with _connect(self._database_path) as connection:
             connection.execute(
                 """
                 INSERT INTO service_state (key, timestamp) VALUES ('worker', ?)
@@ -93,14 +95,14 @@ class JobRepository:
             )
 
     def worker_last_seen_at(self) -> datetime | None:
-        with self._connect() as connection:
+        with _connect(self._database_path) as connection:
             row = connection.execute(
                 "SELECT timestamp FROM service_state WHERE key = 'worker'"
             ).fetchone()
         return datetime.fromisoformat(row["timestamp"]) if row is not None else None
 
     def save(self, record: JobRecord) -> None:
-        with self._connect() as connection:
+        with _connect(self._database_path) as connection:
             connection.execute(
                 """
                 UPDATE jobs SET
@@ -132,12 +134,12 @@ class JobRepository:
             )
 
     def delete(self, job_id: str) -> None:
-        with self._connect() as connection:
+        with _connect(self._database_path) as connection:
             connection.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
 
     def delete_expired_terminal_jobs(self, retention: timedelta) -> list[str]:
         cutoff = datetime.now(UTC) - retention
-        with self._connect() as connection:
+        with _connect(self._database_path) as connection:
             rows = connection.execute(
                 """
                 SELECT job_id FROM jobs
@@ -157,7 +159,7 @@ class JobRepository:
         return ids
 
     def _initialize(self) -> None:
-        with self._connect() as connection:
+        with _connect(self._database_path) as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute(
                 """
@@ -190,12 +192,6 @@ class JobRepository:
                 )
                 """
             )
-
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self._database_path, timeout=10)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=10000")
-        return connection
 
     @staticmethod
     def _record(row: sqlite3.Row | None) -> JobRecord | None:
@@ -249,12 +245,12 @@ class VoiceRepository:
     def __init__(self, database_path: Path) -> None:
         self._database_path = database_path
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
+        with _connect(self._database_path) as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             _create_voices_table(connection)
 
     def create(self, record: VoiceRecord) -> None:
-        with self._connect() as connection:
+        with _connect(self._database_path) as connection:
             connection.execute(
                 """
                 INSERT INTO voices (
@@ -266,7 +262,7 @@ class VoiceRepository:
             )
 
     def get(self, voice_id: str) -> VoiceRecord | None:
-        with self._connect() as connection:
+        with _connect(self._database_path) as connection:
             row = connection.execute(
                 "SELECT * FROM voices WHERE voice_id = ?",
                 (voice_id,),
@@ -274,25 +270,31 @@ class VoiceRepository:
         return _voice_record(row)
 
     def list_all(self) -> list[VoiceRecord]:
-        with self._connect() as connection:
+        with _connect(self._database_path) as connection:
             rows = connection.execute(
                 "SELECT * FROM voices ORDER BY created_at DESC, voice_id"
             ).fetchall()
         return [_voice_record(row) for row in rows if row is not None]
 
     def delete(self, voice_id: str) -> None:
-        with self._connect() as connection:
+        with _connect(self._database_path) as connection:
             connection.execute("DELETE FROM voices WHERE voice_id = ?", (voice_id,))
-
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self._database_path, timeout=10)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=10000")
-        return connection
 
 
 def _timestamp(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
+
+
+@contextmanager
+def _connect(database_path: Path) -> Iterator[sqlite3.Connection]:
+    connection = sqlite3.connect(database_path, timeout=10)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout=10000")
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
 
 
 def _create_voices_table(connection: sqlite3.Connection) -> None:
