@@ -1,17 +1,27 @@
 import asyncio
 import hashlib
 import logging
+import os
 import sqlite3
 import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from .audio import WavFileAssembler
+from .audio import (
+    AudioFormat,
+    frames_to_ms,
+    raw_byte_count,
+    read_wav_segment,
+    silence_frames,
+    write_wav_from_raw,
+)
 from .models import (
     ChapterManifest,
     CreateJobRequest,
+    ErrorInfo,
     JobRecord,
+    JobSentenceRecord,
     JobState,
     LanguageCode,
     ManifestSentence,
@@ -36,16 +46,15 @@ class IdempotencyConflictError(ValueError):
 
 
 class _JobCancelled(Exception):
-    pass
+    """Sentinel raised when cancellation is detected mid-process."""
 
 
 class JobFiles:
     def __init__(self, jobs_dir: Path, job_id: str) -> None:
         self.root = jobs_dir / job_id
-        self.input = self.root / "input"
-        self.segments = self.root / "segments"
+        self.snapshot = self.root / "snapshot"
         self.request = self.root / "request.json"
-        self.partial_audio = self.root / "audio.partial.wav"
+        self.partial_audio = self.root / "audio.partial.raw"
         self.audio = self.root / "audio.wav"
         self.manifest = self.root / "manifest.json"
 
@@ -106,11 +115,11 @@ class JobManager:
         )
         files = self.files(record.job_id)
         try:
-            files.input.mkdir(parents=True)
-            files.segments.mkdir()
+            files.snapshot.mkdir(parents=True)
             files.request.write_text(request.model_dump_json(indent=2), encoding="utf-8")
-            self.voice_manager.snapshot_to(request.voice_id, files.input)
+            self.voice_manager.snapshot_to(request.voice_id, files.snapshot)
             self.repository.create(record)
+        # Race condition: another request inserted the same idempotency key between our lookup and INSERT.
         except sqlite3.IntegrityError as exc:
             shutil.rmtree(files.root, ignore_errors=True)
             existing = self.repository.find_by_idempotency_key(idempotency_key)
@@ -200,20 +209,22 @@ class JobWorker:
 
     async def process(self, record: JobRecord) -> None:
         files = self.manager.files(record.job_id)
-        publishing = False
+        artifact_phase = False
         active_sentence_id: str | None = None
+
         try:
             request = self.manager.load_request(record.job_id)
-            files.segments.mkdir(parents=True, exist_ok=True)
+
             if self._cancelled(record.job_id):
                 self._purge_cancelled(record.job_id)
                 return
-            completed = _completed_segment_prefix(files.segments, record.total_sentences)
+
+            _truncate_partial_audio(record, files)
+
+            completed = record.completed_sentences
             record.state = JobState.RUNNING
-            record.completed_sentences = completed
-            record.error_code = None
-            record.error_message = None
-            record.error_sentence_id = None
+            record.error = None
+
             self._touch(record)
             logger.info(
                 "Job processing started: job_id=%s sentences_completed=%s sentences_total=%s",
@@ -223,9 +234,11 @@ class JobWorker:
             )
 
             for index in range(completed, record.total_sentences):
+
                 if self._cancelled(record.job_id):
                     self._purge_cancelled(record.job_id)
                     return
+
                 sentence = request.sentences[index]
                 active_sentence_id = sentence.id
                 audio = await self._synthesize_with_retry(
@@ -233,30 +246,76 @@ class JobWorker:
                     record.job_id,
                     request.text_language,
                 )
+
                 if self._cancelled(record.job_id):
                     self._purge_cancelled(record.job_id)
                     return
-                temporary = files.segments / f"{index:06d}.wav.tmp"
-                segment = files.segments / f"{index:06d}.wav"
-                temporary.write_bytes(audio)
-                temporary.replace(segment)
-                record.completed_sentences = index + 1
-                self._touch(record)
 
-            publishing = True
+                target_format = _audio_format(record)
+                pcm = read_wav_segment(audio, target_format)
+                if target_format is None:
+                    record.audio_channels = pcm.format.channels
+                    record.audio_sample_width = pcm.format.sample_width
+                    record.audio_frame_rate = pcm.format.frame_rate
+                    target_format = pcm.format
+                assert target_format is not None
+
+                duration_ms = frames_to_ms(pcm.frame_count, target_format.frame_rate)
+                if len(sentence.text) > 20 and duration_ms < 200:
+                    logger.warning(
+                        "Synthesis produced suspiciously short audio: job_id=%s sentence_id=%s "
+                        "text_preview=%r duration_ms=%s",
+                        record.job_id,
+                        sentence.id,
+                        sentence.text[:60],
+                        duration_ms,
+                    )
+
+                if index > 0 and request.sentence_gap_ms:
+                    gap = silence_frames(target_format, request.sentence_gap_ms)
+                else:
+                    gap = b""
+
+                start_frame = record.committed_frames + _frame_count(gap, target_format)
+                end_frame = start_frame + pcm.frame_count
+                with files.partial_audio.open("ab") as partial:
+                    partial.write(gap)
+                    partial.write(pcm.frames)
+                    partial.flush()
+                    os.fsync(partial.fileno())
+
+                record.completed_sentences = index + 1
+                record.committed_frames = end_frame
+
+                self._prepare_touch(record)
+                committed = self.manager.repository.commit_sentence(
+                    record,
+                    JobSentenceRecord(
+                        job_id=record.job_id,
+                        sentence_index=index,
+                        sentence_id=sentence.id,
+                        paragraph_index=sentence.paragraph_index,
+                        begin_ms=frames_to_ms(start_frame, target_format.frame_rate),
+                        end_ms=frames_to_ms(end_frame, target_format.frame_rate),
+                    ),
+                )
+                if not committed:
+                    raise _JobCancelled
+
+            artifact_phase = True
             size_bytes, digest = await asyncio.to_thread(
                 _publish_artifacts,
                 files,
                 request,
+                record,
+                self.manager.repository.list_sentences(record.job_id),
             )
-            if self._cancelled(record.job_id):
-                self._purge_cancelled(record.job_id)
-                return
+
             record.state = JobState.SUCCEEDED
             record.audio_size_bytes = size_bytes
             record.audio_sha256 = digest
             self._touch(record)
-            await asyncio.to_thread(shutil.rmtree, files.segments, True)
+            files.partial_audio.unlink(missing_ok=True)
             logger.info(
                 "Job succeeded: job_id=%s sentences_total=%s audio_size_bytes=%s",
                 record.job_id,
@@ -268,28 +327,37 @@ class JobWorker:
         except SynthesisError as exc:
             files.partial_audio.unlink(missing_ok=True)
             record.state = JobState.FAILED
-            record.error_code = exc.code
-            record.error_message = exc.message
-            record.error_sentence_id = active_sentence_id
+            record.error = ErrorInfo(
+                code=exc.code,
+                message=exc.message,
+                sentence_id=active_sentence_id,
+            )
             self._touch(record)
             logger.warning(
                 "Job failed: job_id=%s error_code=%s sentence_id=%s",
                 record.job_id,
-                record.error_code,
-                record.error_sentence_id,
+                record.error.code,
+                record.error.sentence_id,
             )
         except Exception:
             files.partial_audio.unlink(missing_ok=True)
             logger.exception("Job failed unexpectedly: job_id=%s", record.job_id)
-            record.state = JobState.FAILED
-            if publishing:
-                record.error_code = "artifact_publication_failed"
-                record.error_message = "Failed to publish the generated audio artifact."
+            failed = self.manager.repository.get(record.job_id)
+            if failed is None:
+                return  # Job was deleted concurrently; no state to persist.
+            failed.state = JobState.FAILED
+            if artifact_phase:
+                failed.error = ErrorInfo(
+                    code="artifact_publication_failed",
+                    message="Failed to publish the generated audio artifact.",
+                )
             else:
-                record.error_code = "internal_error"
-                record.error_message = "Audio generation failed unexpectedly."
-            record.error_sentence_id = active_sentence_id if not publishing else None
-            self._touch(record)
+                failed.error = ErrorInfo(
+                    code="internal_error",
+                    message="Audio generation failed unexpectedly.",
+                    sentence_id=active_sentence_id,
+                )
+            self._touch(failed)
 
     async def _synthesize_with_retry(
         self,
@@ -315,55 +383,48 @@ class JobWorker:
         self.manager.purge(job_id)
 
     def _touch(self, record: JobRecord) -> None:
+        self._prepare_touch(record)
+        self.manager.repository.save(record)
+
+    @staticmethod
+    def _prepare_touch(record: JobRecord) -> None:
         now = datetime.now(UTC)
         record.updated_at = now
         if record.state == JobState.RUNNING:
             record.heartbeat_at = now
-        self.manager.repository.save(record)
 
 
 def _publish_artifacts(
     files: JobFiles,
     request: CreateJobRequest,
+    record: JobRecord,
+    sentences: list[JobSentenceRecord],
 ) -> tuple[int, str]:
-    with WavFileAssembler(
-        files.partial_audio,
-        sentence_gap_ms=request.sentence_gap_ms,
-    ) as assembler:
-        for index in range(len(request.sentences)):
-            assembler.append((files.segments / f"{index:06d}.wav").read_bytes())
-        assembly = assembler.result()
-    files.partial_audio.replace(files.audio)
+    audio_format = _require_audio_format(record)
+    if len(sentences) != len(request.sentences):
+        raise ValueError("Job sentence timing metadata is incomplete.")
+    temporary = files.root / "audio.tmp.wav"
+    write_wav_from_raw(files.partial_audio, temporary, audio_format, expected_frames=record.committed_frames)
+    temporary.replace(files.audio)
 
     manifest = ChapterManifest(
         chapter_id=request.chapter_id,
         voice_id=request.voice_id,
         text_language=request.text_language,
-        duration_ms=assembly.duration_ms,
+        duration_ms=frames_to_ms(record.committed_frames, audio_format.frame_rate),
         sentence_gap_ms=request.sentence_gap_ms,
         sentences=[
             ManifestSentence(
-                id=sentence.id,
+                id=sentence.sentence_id,
                 paragraph_index=sentence.paragraph_index,
-                begin_ms=begin_ms,
-                end_ms=end_ms,
+                begin_ms=sentence.begin_ms,
+                end_ms=sentence.end_ms,
             )
-            for sentence, (begin_ms, end_ms) in zip(
-                request.sentences,
-                assembly.timestamps_ms,
-                strict=True,
-            )
+            for sentence in sentences
         ],
     )
     files.manifest.write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
     return files.audio.stat().st_size, _sha256(files.audio)
-
-
-def _completed_segment_prefix(segments_dir: Path, sentence_count: int) -> int:
-    for index in range(sentence_count):
-        if not (segments_dir / f"{index:06d}.wav").exists():
-            return index
-    return sentence_count
 
 
 def _sha256(path: Path) -> str:
@@ -379,3 +440,50 @@ def _valid_job_id(job_id: str) -> bool:
         return str(UUID(job_id)) == job_id
     except ValueError:
         return False
+
+
+def _audio_format(record: JobRecord) -> AudioFormat | None:
+    if (
+        record.audio_channels is None
+        or record.audio_sample_width is None
+        or record.audio_frame_rate is None
+    ):
+        return None
+    return AudioFormat(
+        channels=record.audio_channels,
+        sample_width=record.audio_sample_width,
+        frame_rate=record.audio_frame_rate,
+        compression_type="NONE",
+    )
+
+
+def _require_audio_format(record: JobRecord) -> AudioFormat:
+    audio_format = _audio_format(record)
+    if audio_format is None:
+        raise ValueError("Job audio format is missing.")
+    return audio_format
+
+
+def _frame_count(frames: bytes, audio_format: AudioFormat) -> int:
+    frame_size = audio_format.channels * audio_format.sample_width
+    if frame_size <= 0:
+        raise ValueError("Invalid audio frame size.")
+    return len(frames) // frame_size
+
+
+def _truncate_partial_audio(record: JobRecord, files: JobFiles) -> None:
+    audio_format = _audio_format(record)
+    if audio_format is None:
+        files.partial_audio.unlink(missing_ok=True)
+        return
+    expected_bytes = raw_byte_count(record.committed_frames, audio_format)
+    if not files.partial_audio.exists():
+        if expected_bytes:
+            raise ValueError("Partial audio checkpoint is missing.")
+        return
+    actual_bytes = files.partial_audio.stat().st_size
+    if actual_bytes < expected_bytes:
+        raise ValueError("Partial audio checkpoint is shorter than recorded progress.")
+    if actual_bytes > expected_bytes:
+        with files.partial_audio.open("r+b") as partial:
+            partial.truncate(expected_bytes)

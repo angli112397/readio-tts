@@ -104,6 +104,12 @@ class ChapterManifest(BaseModel):
     sentences: list[ManifestSentence]
 
 
+class ErrorInfo(BaseModel):
+    code: str
+    message: str
+    sentence_id: str | None = None
+
+
 class JobRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -115,14 +121,25 @@ class JobRecord(BaseModel):
     state: JobState
     total_sentences: int
     completed_sentences: int = 0
+    committed_frames: int = 0
+    audio_channels: int | None = None
+    audio_sample_width: int | None = None
+    audio_frame_rate: int | None = None
     created_at: datetime
     updated_at: datetime
     heartbeat_at: datetime | None = None
     audio_size_bytes: int | None = None
     audio_sha256: str | None = None
-    error_code: str | None = None
-    error_message: str | None = None
-    error_sentence_id: str | None = None
+    error: ErrorInfo | None = None
+
+
+class JobSentenceRecord(BaseModel):
+    job_id: str
+    sentence_index: int
+    sentence_id: str
+    paragraph_index: int
+    begin_ms: int
+    end_ms: int
 
 
 class CreateJobResponse(BaseModel):
@@ -142,12 +159,6 @@ class JobArtifact(BaseModel):
     mime_type: str = "audio/wav"
     size_bytes: int
     sha256: str
-
-
-class ErrorInfo(BaseModel):
-    code: str
-    message: str
-    sentence_id: str | None = None
 
 
 class ErrorResponse(BaseModel):

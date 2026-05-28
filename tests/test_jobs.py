@@ -7,8 +7,15 @@ from threading import Barrier
 
 import pytest
 import readio_tts.jobs as jobs_module
+from readio_tts.audio import frames_to_ms, read_wav_segment
 from readio_tts.jobs import IdempotencyConflictError, JobManager, JobWorker
-from readio_tts.models import CreateJobRequest, JobState, SentenceRequest, VoiceRecord
+from readio_tts.models import (
+    CreateJobRequest,
+    JobSentenceRecord,
+    JobState,
+    SentenceRequest,
+    VoiceRecord,
+)
 from readio_tts.providers import MockSpeechProvider, SynthesisError
 from readio_tts.repository import JobRepository, VoiceRepository
 from readio_tts.voices import VoiceManager, VoiceUnavailableError
@@ -73,9 +80,9 @@ def test_worker_publishes_audio_manifest_and_sqlite_progress(tmp_path: Path) -> 
         assert completed.audio_size_bytes
         assert completed.audio_sha256
         assert manager.files(job.job_id).audio.exists()
+        assert not manager.files(job.job_id).partial_audio.exists()
         manifest = json.loads(manager.files(job.job_id).manifest.read_text(encoding="utf-8"))
         assert manifest["sentences"][1]["begin_ms"] - manifest["sentences"][0]["end_ms"] == 400
-        assert not manager.files(job.job_id).segments.exists()
 
     asyncio.run(exercise())
 
@@ -94,9 +101,9 @@ def test_create_snapshots_selected_reference_for_a_job(tmp_path: Path) -> None:
 
     job, _ = manager.create_job(make_request(), "snapshot")
 
-    assert (manager.files(job.job_id).input / "reference.wav").read_bytes() == b"reference-audio"
+    assert (manager.files(job.job_id).snapshot / "reference.wav").read_bytes() == b"reference-audio"
     assert (
-        json.loads((manager.files(job.job_id).input / "voice.json").read_text(encoding="utf-8"))
+        json.loads((manager.files(job.job_id).snapshot / "voice.json").read_text(encoding="utf-8"))
         == {"reference_language": "en", "transcript": "prompt"}
     )
 
@@ -242,18 +249,88 @@ def test_worker_restart_reuses_existing_sentence_checkpoint(tmp_path: Path) -> N
         job, _ = manager.create_job(make_request(), "resume-me")
         provider = CountingProvider()
         files = manager.files(job.job_id)
-        (files.segments / "000000.wav").write_bytes(
+        first_sentence = read_wav_segment(
             await provider.synthesize("Hello.", job.job_id, "en")
         )
+        files.partial_audio.write_bytes(first_sentence.frames)
         record = manager.get_job(job.job_id)
         assert record is not None
         record.state = JobState.RUNNING
         record.completed_sentences = 1
-        manager.repository.save(record)
+        record.committed_frames = first_sentence.frame_count
+        record.audio_channels = first_sentence.format.channels
+        record.audio_sample_width = first_sentence.format.sample_width
+        record.audio_frame_rate = first_sentence.format.frame_rate
+        manager.repository.commit_sentence(
+            record,
+            JobSentenceRecord(
+                job_id=job.job_id,
+                sentence_index=0,
+                sentence_id="s1",
+                paragraph_index=0,
+                begin_ms=0,
+                end_ms=frames_to_ms(
+                    first_sentence.frame_count,
+                    first_sentence.format.frame_rate,
+                ),
+            ),
+        )
 
         resumed_provider = CountingProvider()
         worker = JobWorker(manager, resumed_provider)
         assert await worker.run_once()
+        completed = manager.get_job(job.job_id)
+
+        assert completed is not None
+        assert completed.state == JobState.SUCCEEDED
+        assert resumed_provider.texts == ["This is sentence two."]
+
+    asyncio.run(exercise())
+
+
+def test_worker_truncates_partial_audio_back_to_sql_checkpoint(tmp_path: Path) -> None:
+    class CountingProvider(MockSpeechProvider):
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+
+        async def synthesize(self, text: str, job_id: str, text_language: str) -> bytes:
+            self.texts.append(text)
+            return await super().synthesize(text, job_id, text_language)
+
+    async def exercise() -> None:
+        manager = make_manager(tmp_path)
+        job, _ = manager.create_job(make_request(), "truncate-partial")
+        provider = CountingProvider()
+        files = manager.files(job.job_id)
+        first_sentence = read_wav_segment(
+            await provider.synthesize("Hello.", job.job_id, "en")
+        )
+        files.partial_audio.write_bytes(first_sentence.frames + b"\xff" * 40)
+        record = manager.get_job(job.job_id)
+        assert record is not None
+        record.state = JobState.RUNNING
+        record.completed_sentences = 1
+        record.committed_frames = first_sentence.frame_count
+        record.audio_channels = first_sentence.format.channels
+        record.audio_sample_width = first_sentence.format.sample_width
+        record.audio_frame_rate = first_sentence.format.frame_rate
+        manager.repository.commit_sentence(
+            record,
+            JobSentenceRecord(
+                job_id=job.job_id,
+                sentence_index=0,
+                sentence_id="s1",
+                paragraph_index=0,
+                begin_ms=0,
+                end_ms=frames_to_ms(
+                    first_sentence.frame_count,
+                    first_sentence.format.frame_rate,
+                ),
+            ),
+        )
+
+        resumed_provider = CountingProvider()
+        await JobWorker(manager, resumed_provider).run_once()
         completed = manager.get_job(job.job_id)
 
         assert completed is not None
@@ -293,9 +370,10 @@ def test_sentence_failure_retries_once_then_marks_job_failed(
 
         assert failed is not None
         assert failed.state == JobState.FAILED
-        assert failed.error_code == "tts_unavailable"
-        assert failed.error_message == "GPT-SoVITS is unavailable."
-        assert failed.error_sentence_id == "s1"
+        assert failed.error is not None
+        assert failed.error.code == "tts_unavailable"
+        assert failed.error.message == "GPT-SoVITS is unavailable."
+        assert failed.error.sentence_id == "s1"
         assert provider.calls == 2
 
     asyncio.run(exercise())
@@ -321,8 +399,9 @@ def test_non_retryable_sentence_failure_is_recorded_without_retry(tmp_path: Path
         failed = manager.get_job(job.job_id)
 
         assert failed is not None
-        assert failed.error_code == "tts_request_rejected"
-        assert failed.error_sentence_id == "s1"
+        assert failed.error is not None
+        assert failed.error.code == "tts_request_rejected"
+        assert failed.error.sentence_id == "s1"
         assert provider.calls == 1
 
     asyncio.run(exercise())
@@ -422,8 +501,9 @@ def test_artifact_publication_failure_is_reported_separately(
 
         assert failed is not None
         assert failed.state == JobState.FAILED
-        assert failed.error_code == "artifact_publication_failed"
-        assert failed.error_message == "Failed to publish the generated audio artifact."
-        assert failed.error_sentence_id is None
+        assert failed.error is not None
+        assert failed.error.code == "artifact_publication_failed"
+        assert failed.error.message == "Failed to publish the generated audio artifact."
+        assert failed.error.sentence_id is None
 
     asyncio.run(exercise())

@@ -38,6 +38,7 @@ class JobVoiceInput:
     audio_path: Path
     prompt_text: str
     language: LanguageCode
+    remote_audio_path: str  # Container filesystem path for the GPT-SoVITS ref_audio_path payload
 
 
 class GptSoVitsProvider:
@@ -45,6 +46,8 @@ class GptSoVitsProvider:
 
     def __init__(self, settings: Settings, client: httpx.AsyncClient | None = None) -> None:
         self._jobs_dir = settings.data_dir / "jobs"
+        # GPT-SoVITS runs in Docker; ref_audio_path in the payload must use the container's
+        # filesystem view, not the host path.
         self._remote_jobs_dir = PurePosixPath(settings.gpt_job_data_remote_dir)
         self._options: dict[str, object] = {
             "text_split_method": settings.gpt_text_split_method,
@@ -59,22 +62,21 @@ class GptSoVitsProvider:
             "streaming_mode": False,
         }
         headers = {"Accept": "audio/wav"}
+        # External injection is for test isolation; _owns_client tracks whether we should close it.
         self._client = client or httpx.AsyncClient(
             base_url=settings.gpt_base_url.rstrip("/"),
             timeout=settings.gpt_timeout_seconds,
             headers=headers,
         )
         self._owns_client = client is None
+        self._voice_cache: dict[str, JobVoiceInput] = {}
 
     async def synthesize(self, text: str, job_id: str, text_language: LanguageCode) -> bytes:
         voice = self._resolve_job_voice(job_id)
-        remote_audio_path = str(
-            self._remote_jobs_dir / job_id / "input" / voice.audio_path.name
-        )
         payload = {
             "text": text,
             "text_lang": text_language,
-            "ref_audio_path": remote_audio_path,
+            "ref_audio_path": voice.remote_audio_path,
             "prompt_text": voice.prompt_text,
             "prompt_lang": voice.language,
             **self._options,
@@ -96,7 +98,7 @@ class GptSoVitsProvider:
                 "text_preview=%r response=%s",
                 job_id,
                 response.status_code,
-                remote_audio_path,
+                voice.remote_audio_path,
                 text[:80],
                 detail,
             )
@@ -115,26 +117,31 @@ class GptSoVitsProvider:
                 "invalid_tts_response",
                 "GPT-SoVITS returned invalid audio data.",
             )
-        return response.content
+        return _require_valid_wav_response(response.content)
 
     async def close(self) -> None:
         if self._owns_client:
             await self._client.aclose()
 
     def _resolve_job_voice(self, job_id: str) -> JobVoiceInput:
-        input_dir = self._jobs_dir / job_id / "input"
-        if not input_dir.is_dir():
+        if job_id not in self._voice_cache:
+            self._voice_cache[job_id] = self._load_job_voice(job_id)
+        return self._voice_cache[job_id]
+
+    def _load_job_voice(self, job_id: str) -> JobVoiceInput:
+        snapshot_dir = self._jobs_dir / job_id / "snapshot"
+        if not snapshot_dir.is_dir():
             raise SynthesisError(
                 "reference_snapshot_missing",
                 "The job reference audio snapshot is missing.",
             )
-        audio = input_dir / "reference.wav"
+        audio = snapshot_dir / "reference.wav"
         if not audio.exists():
             raise SynthesisError(
                 "reference_snapshot_missing",
                 "The job reference audio snapshot is missing.",
             )
-        metadata_path = input_dir / "voice.json"
+        metadata_path = snapshot_dir / "voice.json"
         if not metadata_path.exists():
             raise SynthesisError(
                 "reference_snapshot_missing",
@@ -153,8 +160,8 @@ class GptSoVitsProvider:
             audio_path=audio,
             prompt_text=metadata.transcript,
             language=metadata.reference_language,
+            remote_audio_path=str(self._remote_jobs_dir / job_id / "snapshot" / audio.name),
         )
-
 
 def _response_detail(response: httpx.Response) -> str:
     try:
@@ -165,6 +172,27 @@ def _response_detail(response: httpx.Response) -> str:
         pass
     detail = " ".join(response.text.split())
     return (detail or response.reason_phrase)[:200]
+
+
+def _require_valid_wav_response(audio: bytes) -> bytes:
+    try:
+        with wave.open(BytesIO(audio), "rb") as reader:
+            if reader.getcomptype() != "NONE":
+                raise SynthesisError(
+                    "invalid_tts_response",
+                    "GPT-SoVITS returned compressed audio instead of PCM WAV.",
+                )
+            if reader.getframerate() <= 0 or reader.getnframes() <= 0:
+                raise SynthesisError(
+                    "invalid_tts_response",
+                    "GPT-SoVITS returned empty audio.",
+                )
+    except (EOFError, wave.Error) as exc:
+        raise SynthesisError(
+            "invalid_tts_response",
+            "GPT-SoVITS returned invalid audio data.",
+        ) from exc
+    return audio
 
 
 class MockSpeechProvider:
@@ -192,6 +220,7 @@ class MockSpeechProvider:
 
     async def close(self) -> None:
         return None
+
 
 def create_provider(settings: Settings) -> SpeechProvider:
     if settings.provider == "gpt":

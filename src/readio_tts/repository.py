@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from .models import JobRecord, JobState, VoiceRecord
+from .models import ErrorInfo, JobRecord, JobSentenceRecord, JobState, VoiceRecord
 
 
 class JobRepository:
@@ -19,10 +19,11 @@ class JobRepository:
                 """
                 INSERT INTO jobs (
                     job_id, idempotency_key, chapter_id, voice_id, model_revision,
-                    state, total_sentences, completed_sentences, created_at,
+                    state, total_sentences, completed_sentences, committed_frames,
+                    audio_channels, audio_sample_width, audio_frame_rate, created_at,
                     updated_at, heartbeat_at, audio_size_bytes, audio_sha256,
                     error_code, error_message, error_sentence_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._values(record),
             )
@@ -108,9 +109,11 @@ class JobRepository:
                 UPDATE jobs SET
                     idempotency_key = ?, chapter_id = ?, voice_id = ?,
                     model_revision = ?, state = ?, total_sentences = ?,
-                    completed_sentences = ?, created_at = ?, updated_at = ?, heartbeat_at = ?,
-                    audio_size_bytes = ?, audio_sha256 = ?, error_code = ?,
-                    error_message = ?, error_sentence_id = ?
+                    completed_sentences = ?, committed_frames = ?, audio_channels = ?,
+                    audio_sample_width = ?, audio_frame_rate = ?, created_at = ?,
+                    updated_at = ?, heartbeat_at = ?, audio_size_bytes = ?,
+                    audio_sha256 = ?, error_code = ?, error_message = ?,
+                    error_sentence_id = ?
                 WHERE job_id = ?
                 """,
                 (
@@ -121,21 +124,103 @@ class JobRepository:
                     record.state.value,
                     record.total_sentences,
                     record.completed_sentences,
+                    record.committed_frames,
+                    record.audio_channels,
+                    record.audio_sample_width,
+                    record.audio_frame_rate,
                     record.created_at.isoformat(),
                     record.updated_at.isoformat(),
                     _timestamp(record.heartbeat_at),
                     record.audio_size_bytes,
                     record.audio_sha256,
-                    record.error_code,
-                    record.error_message,
-                    record.error_sentence_id,
+                    record.error.code if record.error else None,
+                    record.error.message if record.error else None,
+                    record.error.sentence_id if record.error else None,
                     record.job_id,
                 ),
             )
 
+    def commit_sentence(self, record: JobRecord, sentence: JobSentenceRecord) -> bool:
+        """Atomically commit a sentence and update job progress. Returns False if the job no longer exists."""
+        with _connect(self._database_path) as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO job_sentences (
+                    job_id, sentence_index, sentence_id, paragraph_index, begin_ms, end_ms
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sentence.job_id,
+                    sentence.sentence_index,
+                    sentence.sentence_id,
+                    sentence.paragraph_index,
+                    sentence.begin_ms,
+                    sentence.end_ms,
+                ),
+            )
+            cursor = connection.execute(
+                """
+                UPDATE jobs SET
+                    idempotency_key = ?, chapter_id = ?, voice_id = ?,
+                    model_revision = ?, state = ?, total_sentences = ?,
+                    completed_sentences = ?, committed_frames = ?, audio_channels = ?,
+                    audio_sample_width = ?, audio_frame_rate = ?, created_at = ?,
+                    updated_at = ?, heartbeat_at = ?, audio_size_bytes = ?,
+                    audio_sha256 = ?, error_code = ?, error_message = ?,
+                    error_sentence_id = ?
+                WHERE job_id = ?
+                """,
+                (
+                    record.idempotency_key,
+                    record.chapter_id,
+                    record.voice_id,
+                    record.model_revision,
+                    record.state.value,
+                    record.total_sentences,
+                    record.completed_sentences,
+                    record.committed_frames,
+                    record.audio_channels,
+                    record.audio_sample_width,
+                    record.audio_frame_rate,
+                    record.created_at.isoformat(),
+                    record.updated_at.isoformat(),
+                    _timestamp(record.heartbeat_at),
+                    record.audio_size_bytes,
+                    record.audio_sha256,
+                    record.error.code if record.error else None,
+                    record.error.message if record.error else None,
+                    record.error.sentence_id if record.error else None,
+                    record.job_id,
+                ),
+            )
+            return cursor.rowcount > 0
+
+    def list_sentences(self, job_id: str) -> list[JobSentenceRecord]:
+        with _connect(self._database_path) as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM job_sentences
+                WHERE job_id = ?
+                ORDER BY sentence_index
+                """,
+                (job_id,),
+            ).fetchall()
+        return [
+            JobSentenceRecord(
+                job_id=row["job_id"],
+                sentence_index=row["sentence_index"],
+                sentence_id=row["sentence_id"],
+                paragraph_index=row["paragraph_index"],
+                begin_ms=row["begin_ms"],
+                end_ms=row["end_ms"],
+            )
+            for row in rows
+        ]
+
     def delete(self, job_id: str) -> None:
         with _connect(self._database_path) as connection:
             connection.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+            connection.execute("DELETE FROM job_sentences WHERE job_id = ?", (job_id,))
 
     def delete_expired_terminal_jobs(self, retention: timedelta) -> list[str]:
         cutoff = datetime.now(UTC) - retention
@@ -156,6 +241,10 @@ class JobRepository:
                 "DELETE FROM jobs WHERE job_id = ?",
                 [(job_id,) for job_id in ids],
             )
+            connection.executemany(
+                "DELETE FROM job_sentences WHERE job_id = ?",
+                [(job_id,) for job_id in ids],
+            )
         return ids
 
     def _initialize(self) -> None:
@@ -172,14 +261,35 @@ class JobRepository:
                     state TEXT NOT NULL,
                     total_sentences INTEGER NOT NULL,
                     completed_sentences INTEGER NOT NULL DEFAULT 0,
+                    committed_frames INTEGER NOT NULL DEFAULT 0,
+                    audio_channels INTEGER,
+                    audio_sample_width INTEGER,
+                    audio_frame_rate INTEGER,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     heartbeat_at TEXT,
                     audio_size_bytes INTEGER,
                     audio_sha256 TEXT,
                     error_code TEXT,
-                    error_message TEXT,
+                    error_message TEXT CHECK (error_message IS NOT NULL OR error_code IS NULL),
                     error_sentence_id TEXT
+                )
+                """
+            )
+            _ensure_column(connection, "jobs", "committed_frames", "INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(connection, "jobs", "audio_channels", "INTEGER")
+            _ensure_column(connection, "jobs", "audio_sample_width", "INTEGER")
+            _ensure_column(connection, "jobs", "audio_frame_rate", "INTEGER")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS job_sentences (
+                    job_id TEXT NOT NULL,
+                    sentence_index INTEGER NOT NULL,
+                    sentence_id TEXT NOT NULL,
+                    paragraph_index INTEGER NOT NULL,
+                    begin_ms INTEGER NOT NULL,
+                    end_ms INTEGER NOT NULL,
+                    PRIMARY KEY (job_id, sentence_index)
                 )
                 """
             )
@@ -206,6 +316,10 @@ class JobRepository:
             state=JobState(row["state"]),
             total_sentences=row["total_sentences"],
             completed_sentences=row["completed_sentences"],
+            committed_frames=row["committed_frames"],
+            audio_channels=row["audio_channels"],
+            audio_sample_width=row["audio_sample_width"],
+            audio_frame_rate=row["audio_frame_rate"],
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
             heartbeat_at=(
@@ -215,9 +329,15 @@ class JobRepository:
             ),
             audio_size_bytes=row["audio_size_bytes"],
             audio_sha256=row["audio_sha256"],
-            error_code=row["error_code"],
-            error_message=row["error_message"],
-            error_sentence_id=row["error_sentence_id"],
+            error=(
+                ErrorInfo(
+                    code=row["error_code"],
+                    message=row["error_message"] or "",
+                    sentence_id=row["error_sentence_id"],
+                )
+                if row["error_code"] is not None
+                else None
+            ),
         )
 
     @staticmethod
@@ -231,14 +351,18 @@ class JobRepository:
             record.state.value,
             record.total_sentences,
             record.completed_sentences,
+            record.committed_frames,
+            record.audio_channels,
+            record.audio_sample_width,
+            record.audio_frame_rate,
             record.created_at.isoformat(),
             record.updated_at.isoformat(),
             _timestamp(record.heartbeat_at),
             record.audio_size_bytes,
             record.audio_sha256,
-            record.error_code,
-            record.error_message,
-            record.error_sentence_id,
+            record.error.code if record.error else None,
+            record.error.message if record.error else None,
+            record.error.sentence_id if record.error else None,
         )
 
 class VoiceRepository:
@@ -283,6 +407,20 @@ class VoiceRepository:
 
 def _timestamp(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
+
+
+def _ensure_column(
+    connection: sqlite3.Connection,
+    table: str,
+    name: str,
+    definition: str,
+) -> None:
+    columns = {
+        row["name"]
+        for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if name not in columns:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 @contextmanager

@@ -13,7 +13,7 @@ os.environ["READIO_API_TOKEN"] = "test-readio-api-token"
 
 from readio_tts import api
 from readio_tts.jobs import JobManager, JobWorker
-from readio_tts.models import VoiceRecord
+from readio_tts.models import ErrorInfo, VoiceRecord
 from readio_tts.providers import MockSpeechProvider
 from readio_tts.repository import JobRepository, VoiceRepository
 from readio_tts.voices import VoiceManager
@@ -425,9 +425,11 @@ def test_failed_job_exposes_error_code_and_sentence_id(
     manager = install_manager(tmp_path, monkeypatch)
     job, _ = manager.create_job(api.CreateJobRequest.model_validate(request_payload()), "failed")
     job.state = api.JobState.FAILED
-    job.error_code = "tts_request_rejected"
-    job.error_message = "The speech engine rejected this sentence."
-    job.error_sentence_id = "s2"
+    job.error = ErrorInfo(
+        code="tts_request_rejected",
+        message="The speech engine rejected this sentence.",
+        sentence_id="s2",
+    )
     manager.repository.save(job)
 
     with TestClient(api.app, headers=AUTH_HEADERS) as client:

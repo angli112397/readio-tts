@@ -6,10 +6,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+COPY requirements.lock ./
+RUN pip install -r requirements.lock
+
 COPY pyproject.toml README.md ./
 COPY src ./src
 
-RUN pip install .
+RUN pip install --no-deps .
 
 RUN addgroup --system readio \
     && adduser --system --ingroup readio --home /app readio \

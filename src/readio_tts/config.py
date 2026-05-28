@@ -28,11 +28,11 @@ class Settings(BaseSettings):
     gpt_model_revision: str = "v2ProPlus"
     gpt_timeout_seconds: float = 300.0
     gpt_job_data_remote_dir: str = "/var/lib/readio/jobs"
-    gpt_text_split_method: str = "cut0"
-    gpt_batch_size: int = Field(default=1, ge=1, le=16)
+    gpt_text_split_method: str = "cut0"  # "cut0" = no server-side splitting (Android pre-segments sentences)
+    gpt_batch_size: int = Field(default=1, ge=1, le=16)  # 1 = serialize synthesis for predictable ordering
     gpt_top_k: int = Field(default=15, ge=1, le=100)
     gpt_top_p: float = Field(default=1.0, ge=0.1, le=1.0)
     gpt_temperature: float = Field(default=1.0, ge=0.1, le=2.0)
     gpt_speed_factor: float = Field(default=1.0, ge=0.25, le=3.0)
-    gpt_fragment_interval: float = Field(default=0.3, ge=0.0, le=3.0)
-    gpt_seed: int = Field(default=-1, ge=-1)
+    gpt_fragment_interval: float = Field(default=0.3, ge=0.0, le=3.0)  # seconds of silence between model output fragments
+    gpt_seed: int = Field(default=-1, ge=-1)  # -1 = non-deterministic (natural variation in narration)

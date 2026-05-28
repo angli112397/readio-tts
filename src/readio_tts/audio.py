@@ -14,93 +14,69 @@ class AudioFormat:
 
 
 @dataclass(frozen=True)
-class AssemblyResult:
-    timestamps_ms: list[tuple[int, int]]
-    duration_ms: int
-
-
-class WavFileAssembler:
-    """Append sentence WAVs to one output file without retaining chapter audio in RAM."""
-
-    def __init__(self, output_path: Path, sentence_gap_ms: int = 0) -> None:
-        if sentence_gap_ms < 0:
-            raise ValueError("Sentence gap cannot be negative.")
-        self._output_path = output_path
-        self._sentence_gap_ms = sentence_gap_ms
-        self._writer: wave.Wave_write | None = None
-        self._audio_format: AudioFormat | None = None
-        self._total_frames = 0
-        self._timestamps_ms: list[tuple[int, int]] = []
-
-    def __enter__(self) -> "WavFileAssembler":
-        return self
-
-    def __exit__(self, *args: object) -> None:
-        self.close()
-
-    def append(self, segment: bytes) -> None:
-        with wave.open(BytesIO(segment), "rb") as reader:
-            source_format = _read_format(reader)
-            _require_pcm(source_format)
-            raw_frames = reader.readframes(reader.getnframes())
-            if self._audio_format is None:
-                self._audio_format = source_format
-                self._writer = wave.open(str(self._output_path), "wb")
-                self._writer.setnchannels(source_format.channels)
-                self._writer.setsampwidth(source_format.sample_width)
-                self._writer.setframerate(source_format.frame_rate)
-
-            assert self._audio_format is not None
-            normalized_frames = _normalize_pcm(
-                raw_frames,
-                source_format,
-                self._audio_format,
-            )
-
-            assert self._writer is not None
-            if self._timestamps_ms and self._sentence_gap_ms:
-                silence_frames = round(
-                    self._sentence_gap_ms * self._audio_format.frame_rate / 1000
-                )
-                self._writer.writeframes(
-                    b"\0"
-                    * silence_frames
-                    * self._audio_format.channels
-                    * self._audio_format.sample_width
-                )
-                self._total_frames += silence_frames
-
-            sentence_frames = _frame_count(
-                normalized_frames,
-                self._audio_format.channels,
-                self._audio_format.sample_width,
-            )
-            start_frame = self._total_frames
-            self._total_frames += sentence_frames
-            self._timestamps_ms.append(
-                (
-                    _frames_to_ms(start_frame, self._audio_format.frame_rate),
-                    _frames_to_ms(self._total_frames, self._audio_format.frame_rate),
-                )
-            )
-            self._writer.writeframes(normalized_frames)
-
-    def result(self) -> AssemblyResult:
-        if self._audio_format is None:
-            raise ValueError("At least one WAV segment is required.")
-        return AssemblyResult(
-            timestamps_ms=list(self._timestamps_ms),
-            duration_ms=_frames_to_ms(self._total_frames, self._audio_format.frame_rate),
-        )
-
-    def close(self) -> None:
-        if self._writer is not None:
-            self._writer.close()
-            self._writer = None
+class PcmSegment:
+    format: AudioFormat
+    frames: bytes
+    frame_count: int
 
 
 def _frames_to_ms(frames: int, frame_rate: int) -> int:
     return round(frames * 1000 / frame_rate)
+
+
+def frames_to_ms(frames: int, frame_rate: int) -> int:
+    return _frames_to_ms(frames, frame_rate)
+
+
+def read_wav_segment(segment: bytes, target_format: AudioFormat | None = None) -> PcmSegment:
+    with wave.open(BytesIO(segment), "rb") as reader:
+        source_format = _read_format(reader)
+        _require_pcm(source_format)
+        output_format = target_format or source_format
+        raw_frames = reader.readframes(reader.getnframes())
+        frames = _normalize_pcm(raw_frames, source_format, output_format)
+        return PcmSegment(
+            format=output_format,
+            frames=frames,
+            frame_count=_frame_count(
+                frames,
+                output_format.channels,
+                output_format.sample_width,
+            ),
+        )
+
+
+def silence_frames(audio_format: AudioFormat, duration_ms: int) -> bytes:
+    if duration_ms <= 0:
+        return b""
+    frame_count = round(duration_ms * audio_format.frame_rate / 1000)
+    return b"\0" * frame_count * audio_format.channels * audio_format.sample_width
+
+
+def raw_byte_count(frames: int, audio_format: AudioFormat) -> int:
+    return frames * audio_format.channels * audio_format.sample_width
+
+
+def write_wav_from_raw(
+    raw_path: Path,
+    output_path: Path,
+    audio_format: AudioFormat,
+    expected_frames: int | None = None,
+) -> None:
+    with wave.open(str(output_path), "wb") as writer:
+        writer.setnchannels(audio_format.channels)
+        writer.setsampwidth(audio_format.sample_width)
+        writer.setframerate(audio_format.frame_rate)
+        with raw_path.open("rb") as raw_file:
+            for block in iter(lambda: raw_file.read(1024 * 1024), b""):
+                writer.writeframes(block)
+    if expected_frames is not None:
+        with wave.open(str(output_path), "rb") as reader:
+            actual = reader.getnframes()
+        if actual != expected_frames:
+            raise ValueError(
+                f"WAV frame count mismatch after assembly: expected {expected_frames}, got {actual}."
+            )
 
 
 def _read_format(reader: wave.Wave_read) -> AudioFormat:

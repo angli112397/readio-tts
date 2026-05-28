@@ -1,0 +1,72 @@
+annotated-doc==0.0.4
+    # via fastapi
+annotated-types==0.7.0
+    # via pydantic
+anyio==4.13.0
+    # via
+    #   httpx
+    #   starlette
+    #   watchfiles
+certifi==2026.5.20
+    # via
+    #   httpcore
+    #   httpx
+click==8.4.1
+    # via uvicorn
+colorama==0.4.6
+    # via
+    #   click
+    #   uvicorn
+fastapi==0.136.3
+    # via readio-tts (pyproject.toml)
+h11==0.16.0
+    # via
+    #   httpcore
+    #   uvicorn
+httpcore==1.0.9
+    # via httpx
+httptools==0.8.0
+    # via uvicorn
+httpx==0.28.1
+    # via readio-tts (pyproject.toml)
+idna==3.16
+    # via
+    #   anyio
+    #   httpx
+pydantic==2.13.4
+    # via
+    #   fastapi
+    #   pydantic-settings
+pydantic-core==2.46.4
+    # via pydantic
+pydantic-settings==2.14.1
+    # via readio-tts (pyproject.toml)
+python-dotenv==1.2.2
+    # via
+    #   pydantic-settings
+    #   uvicorn
+python-multipart==0.0.29
+    # via readio-tts (pyproject.toml)
+pyyaml==6.0.3
+    # via uvicorn
+starlette==1.2.0
+    # via fastapi
+typing-extensions==4.15.0
+    # via
+    #   anyio
+    #   fastapi
+    #   pydantic
+    #   pydantic-core
+    #   starlette
+    #   typing-inspection
+typing-inspection==0.4.2
+    # via
+    #   fastapi
+    #   pydantic
+    #   pydantic-settings
+uvicorn==0.48.0
+    # via readio-tts (pyproject.toml)
+watchfiles==1.2.0
+    # via uvicorn
+websockets==16.0
+    # via uvicorn

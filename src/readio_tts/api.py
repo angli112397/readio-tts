@@ -1,7 +1,10 @@
+import asyncio
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 import hmac
 import logging
 from pathlib import Path
+import socket
 from typing import Annotated
 
 from fastapi import APIRouter, FastAPI, File, Form, Header, Request, Response, Security, UploadFile, status
@@ -45,7 +48,23 @@ manager = JobManager(
     max_chapter_characters=settings.max_chapter_characters,
     job_retention_days=settings.job_retention_days,
 )
-app = FastAPI(title="Readio TTS", version="0.4.0")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    try:
+        infos = await asyncio.to_thread(
+            socket.getaddrinfo, socket.gethostname(), None, socket.AF_INET
+        )
+        ips = sorted({info[4][0] for info in infos})
+        for ip in ips:
+            logger.info("Gateway ready: http://%s:PORT (configure port in uvicorn args)", ip)
+    except Exception:
+        logger.warning("Could not determine local IP address for Android connection hint.")
+    yield
+
+
+app = FastAPI(title="Readio TTS", version="0.4.0", lifespan=lifespan)
 
 
 class ApiError(Exception):
@@ -228,15 +247,7 @@ async def get_job(job_id: str, request: Request) -> JobResponse:
         updated_at=job.updated_at,
         heartbeat_at=job.heartbeat_at,
         artifact=artifact,
-        error=(
-            ErrorInfo(
-                code=job.error_code,
-                message=job.error_message,
-                sentence_id=job.error_sentence_id,
-            )
-            if job.error_code and job.error_message
-            else None
-        ),
+        error=job.error,
     )
 
 
